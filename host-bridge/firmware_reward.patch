@@ -1,0 +1,72 @@
+diff --git a/main/pong.c b/main/pong.c
+--- a/main/pong.c
++++ b/main/pong.c
+@@ -XX,XX +XX,XX @@
+ #include "pong.h"
+ #include <stdlib.h>
+ #include "joystick.h"
+ #include "rp2040_boot.h"
++
++#include "esp_log.h"
++static const char *TAG = "PONG";
+
+ #define DISP_W 480
+ #define DISP_H 480
+@@ -XX,XX +XX,XX @@
+     int16_t right_paddle_y;        /* CPU-controlled right paddle top Y */
+     int16_t left_paddle_y;         /* player-controlled left paddle top Y */
+
++    int score_left;                /* RL agent score (left paddle) */
++    int score_right;               /* CPU score (right paddle) */
++    lv_obj_t *score_left_label;    /* on-screen score labels */
++    lv_obj_t *score_right_label;
++
+     pong_phase_t state;
+     lv_timer_t *tick_timer;
+ } pong_state_t;
+@@ -XX,XX +XX,XX @@
+     /* PAUSE button (top center, clear of the round-screen clipping) */
+     make_button(scr, 100, 32, (DISP_W - 100) / 2, 8, "PAUSE", pause_btn_cb);
+
++    /* Score labels (left = agent, right = CPU). Reset to 0 each new game. */
++    g.score_left = 0;
++    g.score_right = 0;
++    g.score_left_label = make_label(scr, "0", FONT_MENU, lv_color_white());
++    lv_obj_align(g.score_left_label, LV_ALIGN_TOP_LEFT, 60, 8);
++    g.score_right_label = make_label(scr, "0", FONT_MENU, lv_color_white());
++    lv_obj_align(g.score_right_label, LV_ALIGN_TOP_RIGHT, -60, 8);
++
+     /* Ball */
+     g.ball = make_rect(scr, BALL_SIZE, BALL_SIZE, 0, 0);
+@@ -XX,XX +XX,XX @@
+-    /* Ball escaped a side: just reset, no score */
+-    if (g.ball_x + BALL_SIZE < 0) {
+-        reset_ball(+1);
+-    } else if (g.ball_x > DISP_W) {
+-        reset_ball(-1);
+-    }
++    /* Ball escaped a side: award a point, emit reward over USB-CDC, reset.
++     * Left paddle (agent) guards the LEFT edge; right paddle (CPU) guards RIGHT.
++     * Ball escapes LEFT  -> agent missed -> point for right -> reward -1 -> "P R".
++     * Ball escapes RIGHT -> CPU missed   -> point for left  -> reward +1 -> "P L".
++     * The host parses "P <L|R> <l> <r>" from the ESP32 USB-CDC console. */
++    if (g.ball_x + BALL_SIZE < 0) {
++        g.score_right++;
++        if (g.score_right_label)
++            lv_label_set_text_fmt(g.score_right_label, "%d", g.score_right);
++        ESP_LOGI(TAG, "P R %d %d", g.score_left, g.score_right);
++    } else if (g.ball_x > DISP_W) {
++        g.score_left++;
++        if (g.score_left_label)
++            lv_label_set_text_fmt(g.score_left_label, "%d", g.score_left);
++        ESP_LOGI(TAG, "P L %d %d", g.score_left, g.score_right);
++    }
++    if (g.ball_x + BALL_SIZE < 0 || g.ball_x > DISP_W) {
++        /* serve toward the player who was just scored on */
++        reset_ball(g.ball_x + BALL_SIZE < 0 ? +1 : -1);
++    }
+@@ -XX,XX +XX,XX @@
+         g.ball = NULL;
+         g.left_paddle = g.right_paddle = NULL;
++        g.score_left_label = g.score_right_label = NULL;
+     }

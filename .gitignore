@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# KARC training checkpoints / runs
+pong-rl/runs/
+
+# Generated validation/debug images
+bbox_validation.png
+*.debug.png
+snap_raw.jpg
+snap_obs.jpg
+
+# Pi agent internals + hypothesis test cache
+.pi/
+.hypothesis/
