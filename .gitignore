@@ -15,3 +15,5 @@ snap_obs.jpg
 # Pi agent internals + hypothesis test cache
 .pi/
 .hypothesis/
+
+host-bridge/arduino/*

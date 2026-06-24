@@ -67,6 +67,7 @@ import cv2
 from state_extract import StateExtractor
 from karc import AutonomousBallKARC, ServoKARC
 from safety import SafetyFilter, UP, DOWN, STAY
+from q_planner import QPlanner
 
 NUM_ACTIONS = 3
 
@@ -100,6 +101,7 @@ class KARCAgent:
         self.servo = ServoKARC(delay=delay, num_actions=NUM_ACTIONS,
                                basis=basis)
         self.safety = SafetyFilter(dwell=dwell, conf_thresh=conf_thresh)
+        self.qplanner = QPlanner()
         self.plan_horizon = plan_horizon
         self.steps = 0
         # rolling history of states and my_y for the planner
@@ -120,6 +122,8 @@ class KARCAgent:
         self._last_intercept_t = -1     # frames until ball reaches my side
         self._last_arrive_t = -1        # frames until paddle reaches intercept
         self._last_decision = "init"    # "physics" | "timing-wait" | "timing-move" | "reprobe" | ...
+        self._last_q_winprob = 0.0     # safe-guess win prob of the chosen intercept
+        self._last_q_gate = False      # was Q's gate open for the last decision?
         # re-probe scheduler
         self._plan_frames = 0           # frames spent in PLAN phase
         self._reprobe_active = False
@@ -147,6 +151,8 @@ class KARCAgent:
         # --- POINT SCORED -> ball reset to center by firmware ---
         if reward != 0:
             self.extractor.reset_ball(center=0.5)
+            # tell Q a point resolved so it can train on the last decision
+            self.qplanner.notify_point(reward)
             self._ball_loss_streak = 0
 
         state, found = self.extractor.extract(rgb)
@@ -241,6 +247,10 @@ class KARCAgent:
         np.savez(path,
                  ball_W=self.ball.rls.W,
                  servo_W=self.servo.rls.W,
+                 q_W=self.qplanner.q.rls.W,
+                 q_P=self.qplanner.q.rls.P,
+                 q_baseline_rewards=self.qplanner.q._baseline_rewards,
+                 q_q_rewards=self.qplanner.q._q_rewards,
                  steps=self.steps)
 
     def load(self, path):
@@ -252,6 +262,15 @@ class KARCAgent:
         z = np.load(path)
         self.ball.rls.W = z["ball_W"]
         self.servo.rls.W = z["servo_W"]
+        if "q_W" in z.files:
+            self.qplanner.q.rls.W = z["q_W"]
+            self.qplanner.q.rls.P = z["q_P"]
+            self.qplanner.q._baseline_rewards = list(z["q_baseline_rewards"])
+            self.qplanner.q._q_rewards = list(z["q_q_rewards"])
+            # recompute gate from the loaded reward history
+            self.qplanner.q._reeval_gate()
+            print(f"[karc] loaded Q: {int(self.qplanner.q.rls.n_updates)} updates, "
+                  f"gate {'OPEN' if self.qplanner.q.gate_open else 'closed'}")
         self.steps = int(z["steps"])
         print(f"[karc] loaded checkpoint at step {self.steps}")
 
@@ -303,19 +322,18 @@ class KARCAgent:
         return desired
 
     # ------------------------------------------------------------------ #
-    # Option 3: physics direction + Model B timing planner               #
+    # Q planner: pick WHICH intercept to aim for (Q), then move toward it #
     # ------------------------------------------------------------------ #
     def _physics_timing_plan(self):
-        """The redesigned planner.
+        """The Q-augmented planner.
 
-        1. Predict the ball forward with Model A; find the intercept point
-           (where/when the ball reaches my side).
-        2. DIRECTION = fixed physics rule toward the intercept (uncorruptible
-           by Model B bias).
-        3. TIMING = use Model B to predict the paddle's arrival frame under
-           the chosen direction; decide MOVE-now vs WAIT (STAY) to avoid
-           overshoot and to compensate for actuator latency. If Model B is
-           unreliable, collapse to "move toward the ball now".
+        1. Predict the ball forward with Model A; find WHEN it reaches my
+           side (intercept_t) and the rough intercept_y.
+        2. Q picks WHICH height to aim for: among reachable intercept heights,
+           score each with safe_guess + gate*Q + exploration, pick the best.
+           (Q is trust-gated; while untrained it just uses the safe guess.)
+        3. TIMING (unchanged): use Model B to decide MOVE-now vs WAIT so we
+           arrive at the chosen height at the right time.
         """
         # need enough history + a visible ball to plan
         if len(self._state_hist) < self.ball.delay or not self.last_found['ball']:
@@ -326,75 +344,72 @@ class KARCAgent:
         my_hist = self._my_hist[-self.servo.delay:]
         my_now = my_hist[-1] if my_hist else 0.5
 
-        # --- 1. predict the ball forward, find intercept ---
+        # --- 1. predict the ball forward, find intercept timing ---
         ball_pred = self.ball.rollout(hist, self.plan_horizon)
         # ball_pred: (H, 3) = [bx, by, opp_y] per future step
         intercept_y = None
         intercept_t = None
         for i, p in enumerate(ball_pred):
             bx = p[0]
-            # my paddle is on the LEFT; ball reaches me when bx is small
             if bx <= 0.08:
                 intercept_y = p[1]
-                intercept_t = i + 1          # frames until intercept (1-indexed)
+                intercept_t = i + 1
                 break
         if intercept_y is None:
-            # ball not reaching my side within horizon: aim at the horizon-end
-            # predicted y, and treat intercept time as the full horizon.
             intercept_y = ball_pred[-1][1]
             intercept_t = self.plan_horizon
 
+        # ball vertical velocity at contact, reconstructed from recent history
+        # (Model A predicts positions; we need vy for the landing-point math).
+        # Use the last two known ball_y values; normalized per frame.
+        if len(self._state_hist) >= 2:
+            ball_vy_norm = (self._state_hist[-1][1] - self._state_hist[-2][1])
+        else:
+            ball_vy_norm = 0.0
+
+        # --- 2. Q picks which height to aim for ---
+        # QPlanner scores reachable candidate heights and returns the best.
+        state_now = self._last_state.copy()
+        target_y, est = self.qplanner.choose_intercept(
+            state_now, ball_vy_norm, my_now)
+
         # diagnostics
-        self._last_intercept_y = float(intercept_y)
+        self._last_intercept_y = float(target_y)
         self._last_my_y = float(my_now)
         self._last_intercept_t = int(intercept_t)
+        self._last_q_winprob = float(est['win_prob'])
+        self._last_q_gate = self.qplanner.q.gate_open
 
-        # --- 2. DIRECTION (physics, uncorruptible) ---
-        dy = intercept_y - my_now
+        # --- 3. DIRECTION toward the Q-chosen target (physics, uncorruptible) ---
+        dy = target_y - my_now
         if dy < -ALIGN_TOL:
             direction = UP
         elif dy > ALIGN_TOL:
             direction = DOWN
         else:
-            # already aligned with the intercept -> hold position
+            # already aligned with the target -> hold position
             self._last_decision = "aligned"
             self._last_arrive_t = 0
             return STAY
 
-        # --- 3. TIMING (Model B): will I arrive in time? should I wait? ---
-        # Predict the paddle's trajectory if I HOLD `direction` for H frames.
+        # --- 4. TIMING (Model B): will I arrive at target_y in time? ---
         pred_paddle = self.servo.rollout_action(my_hist, direction,
                                                 self.plan_horizon)
-        # arrival frame = first future step where paddle is within ARRIVE_TOL
-        # of the intercept (moving in the right direction).
         arrive_t = None
         for i, py in enumerate(pred_paddle):
-            if abs(py - intercept_y) <= ARRIVE_TOL:
+            if abs(py - target_y) <= ARRIVE_TOL:
                 arrive_t = i + 1
                 break
         self._last_arrive_t = int(arrive_t) if arrive_t is not None else -1
 
-        # Can Model B distinguish the direction from STAY? If its prediction
-        # for the chosen direction barely moves the paddle vs. holding, it's
-        # untrained -> safe default: move now (the physics rule is right, we
-        # just can't trust the timing estimate).
         stay_pred = self.servo.predict_next(my_hist, STAY)
         dir_pred = pred_paddle[0] if len(pred_paddle) else my_now
         model_b_alive = abs(dir_pred - stay_pred) > 0.005
 
         if not model_b_alive or arrive_t is None:
-            # Model B unreliable or paddle never reaches intercept in horizon.
-            # Move now (best effort toward the ball). Physics rule governs.
             self._last_decision = "physics"
             return direction
 
-        # We have a sensible arrival estimate. Decide MOVE vs WAIT:
-        #  - arrive_t <= intercept_t: we CAN make it.
-        #    * if we'd arrive >EARLY_MARGIN frames early -> WAIT (STAY),
-        #      starting now would overshoot (velocity control keeps moving).
-        #    * else -> MOVE now (arrive just in time).
-        #  - arrive_t > intercept_t: can't make it even moving now -> MOVE
-        #    now (best effort; at least head toward the intercept).
         if arrive_t <= intercept_t:
             if intercept_t - arrive_t > EARLY_MARGIN:
                 self._last_decision = "timing-wait"

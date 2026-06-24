@@ -138,6 +138,9 @@ def main():
                 pname = {1: "WATCH", 2: "PROBE", 3: "PLAN"}[phase]
                 bupd = agent.ball.rls.n_updates
                 supd = agent.servo.rls.n_updates
+                qdiag = agent.qplanner.diagnostics()
+                qupd = qdiag['q_updates']
+                qgate = 'OPEN' if qdiag['gate_open'] else 'closed'
                 flag = "FROZEN" if agent._frozen else (
                        f"ball_lost_{agent._ball_loss_streak}"
                        if agent._ball_loss_streak > 0 else "ok")
@@ -149,6 +152,7 @@ def main():
                       f"avg_r {avg_r:+.4f} score L{sl}-R{sr} "
                       f"pts_for {pts_for} pts_against {pts_against} "
                       f"ball_upd {bupd} servo_upd {supd} "
+                      f"Q[upd {qupd} {qgate} wp {agent._last_q_winprob:+.2f}] "
                       f"acts U{act_counts[0]}/D{act_counts[1]}/S{act_counts[2]} "
                       f"pad {agent._last_my_y:.2f} ball {agent._last_intercept_y:.2f} "
                       f"t_ball {agent._last_intercept_t} t_pad {agent._last_arrive_t} "
