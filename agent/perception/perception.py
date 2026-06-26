@@ -22,7 +22,7 @@ object. Lighting can't break that — behavior is lighting-invariant.
 import numpy as np
 
 from .proposal import propose_regions
-from .tracker import ObjectTracker
+from .tracker import ObjectTracker, BehaviorUtility
 from .model import ClassModel
 
 
@@ -34,15 +34,28 @@ class Perception:
     ACTION_EFFECT_GATE = 0.005
 
     def __init__(self, frame_h, frame_w, delay=3, num_actions=3,
-                 n_freq=2, cheb_degree=3, forgetting=0.999, z_thresh=None):
+                 n_freq=2, cheb_degree=3, forgetting=0.999, z_thresh=None,
+                 use_utility=True, utility_retire=0.0, utility_warmup=5,
+                 top_k=6, permissive_z=1.5):
         self.frame_h = int(frame_h)
         self.frame_w = int(frame_w)
-        # z_thresh: per-frame seed sensitivity. None = propose_regions default
-        # (good for the clean synthetic scene). Real video is lower-contrast and
-        # noisier (score text, dashed net, glare) so a higher value is needed
-        # there; the caller tunes it for the rig.
+        # Seed mode (Move 1): the DEFAULT seed is top-K (keep the K most salient
+        # regions per frame -- rank-based, brightness-invariant, no knife-edge).
+        # This is what the rig uses; there is NO fallback to a fixed z-thresh by
+        # default. top-K caps the candidate flood so faint real paddles compete
+        # on equal footing with glare for the K slots (no threshold to lose
+        # them behind); move 2 retires the salient junk (glare) downstream.
+        # z_thresh remains available ONLY as an explicit opt-in (top_k=None,
+        # z_thresh=set) for legacy/experimentation -- not the default path.
+        self._top_k = top_k
+        self._permissive_z = permissive_z
         self._z_thresh = z_thresh
-        self.tracker = ObjectTracker()
+        self.utility = (BehaviorUtility(retire_below=utility_retire,
+                                        warmup=utility_warmup)
+                        if use_utility else None)
+        if self.utility is not None:
+            self.utility.set_neutral(num_actions - 1)  # STAY = last action
+        self.tracker = ObjectTracker(utility=self.utility)
         self.classmodel = ClassModel(delay=delay, num_actions=num_actions,
                                      n_freq=n_freq, cheb_degree=cheb_degree,
                                      forgetting=forgetting)
@@ -51,6 +64,12 @@ class Perception:
 
     def reset(self):
         self.tracker.reset()
+        if self.utility is not None:
+            self.utility = BehaviorUtility(
+                retire_below=self.utility.retire_below,
+                warmup=self.utility.warmup)
+            self.utility.set_neutral(self.classmodel.res.num_actions - 1)
+            self.tracker = ObjectTracker(utility=self.utility)
         self.classmodel = ClassModel(
             delay=self.classmodel.res.delay,
             num_actions=self.classmodel.res.num_actions,
@@ -61,9 +80,21 @@ class Perception:
         self._step = 0
 
     def step(self, gray, action):
-        cands = (propose_regions(gray) if self._z_thresh is None
-                 else propose_regions(gray, z_thresh=self._z_thresh))
-        tracks = self.tracker.update(cands, self._step)
+        # Default seed = top-K (rank-based, brightness-invariant). The legacy
+        # fixed-z-thresh path is reached ONLY if the caller explicitly set
+        # top_k=None and z_thresh=<value>; otherwise top-K is used. No silent
+        # fallback to a default z-thresh.
+        if self._top_k is not None:
+            cands = propose_regions(gray, top_k=self._top_k,
+                                    permissive_z=self._permissive_z)
+        elif self._z_thresh is not None:
+            cands = propose_regions(gray, z_thresh=self._z_thresh)
+        else:
+            # top_k=None and no z_thresh given -> still use top-K=6 rather than
+            # the bare propose_regions default, so the no-fallback invariant
+            # holds everywhere.
+            cands = propose_regions(gray, top_k=6, permissive_z=self._permissive_z)
+        tracks = self.tracker.update(cands, self._step, action=self._last_action)
 
         live = set()
         for t in tracks:
@@ -85,6 +116,17 @@ class Perception:
         self._last_action = int(action)
         self._step += 1
         controlled = self.classmodel.controlled_object(self.ACTION_EFFECT_GATE)
+        # Expose each track's behavior CLASS id (perception's 'objects that
+        # move the same way' label) so downstream consumers (the world model)
+        # can key a stable slot by CLASS instead of by the raw track id, which
+        # churns for fast bouncy objects. None while the object is still in
+        # its pre-binding 'watch and see' phase (perception deliberately
+        # delays commitment to GATE_OBS observations).
+        for t in tracks:
+            obj = self.classmodel.objects.get(t["id"])
+            t["class_id"] = (obj.bound_class.id
+                              if obj is not None and obj.bound_class is not None
+                              else None)
         return tracks, controlled
 
     def diagnostics(self):

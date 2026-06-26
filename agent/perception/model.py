@@ -188,28 +188,50 @@ class BehaviorClass:
     def predict(self, hist, action):
         return self.rls.predict(self.res.features(hist, action))
 
-    def signature(self):
-        """Behavioral fingerprint = pure ACTION-CONTRAST, position-invariant.
-        For each probe history h: predict(h, a) - predict(h, neutral) for each
-        non-neutral action a. This isolates HOW THE OBJECT RESPONDS TO THE
-        AGENT'S ACTION (position cancels in the difference). Large for a
-        controlled object, ~0 for a ball / opponent / decoy.
+    def signature_parts(self, motion_gate=1e-3):
+        """Behavioral fingerprint in TWO PARTS, position-invariant.
 
-        Two same-dynamics objects at different locations -> identical
-        signature (verified: distance ~0.0). Controlled vs passive -> ~0.066.
-        The autonomous-dynamics part (how it moves on its own) is intentionally
-        omitted for now: it is per-object noisy and would dilute the clean
-        controlled/passive split. It can be added back (weighted) later to
-        discover finer classes (ball vs opponent vs decoy)."""
+        Half A (action-contrast), RAW: for each probe history h,
+        predict(h, a) - predict(h, neutral) for each non-neutral action a.
+        Isolates HOW THE OBJECT RESPONDS TO THE AGENT'S ACTION (position
+        cancels). Large for a controlled object, ~0 for ball/opponent/decoy.
+        Kept RAW (not normalized) so the existing BIND_THRESH=0.06 scale --
+        calibrated for the controlled/passive split and for controlled-class
+        reuse -- is preserved exactly.
+
+        Half B (autonomous / free motion), UNIT-NORMALIZED: for each probe
+        history h, predict(h, neutral) -- how the object moves when the agent
+        does NOTHING. Big for a fast bouncing ball, medium for a ball-tracking
+        opponent, ~0 for a static decoy. This is the signal that separates
+        the passive sub-classes, which action-contrast alone cannot (every
+        passive object has ~0 action-contrast).
+
+        A half that is genuinely ~0 (norm below EPS) is returned as ZEROS,
+        not divided by ~0 -- otherwise noise is amplified into a random
+        direction and two same-behavior objects fail to match.
+
+        The two halves are returned SEPARATELY so the caller can form a
+        bracket-aware distance (ClassModel._signature_distance): Half B only
+        matters WITHIN the passive bracket. Controlled objects' free-motion
+        is spurious noise comparable to real passive motion, so it must never
+        participate in controlled-controlled comparisons -- that would break
+        controlled-class reuse.
+        """
         neutral = self.NEUTRAL_ACTION
-        sig = []
+        half_a = []   # action-contrast (Δcx, Δcy) per probe per non-neutral action
+        half_b = []   # free motion   (Δcx, Δcy) per probe under neutral
         for h in self._probes:
             base = self.predict(h, neutral)
+            half_b.append(base)                       # autonomous motion
             for a in range(self.res.num_actions):
                 if a == neutral:
                     continue
-                sig.append(self.predict(h, a) - base)   # action-contrast (Δcx, Δcy)
-        return np.concatenate(sig)
+                half_a.append(self.predict(h, a) - base)   # action-contrast
+        half_a = np.concatenate(half_a)
+        half_b = np.concatenate(half_b)
+        nb = np.linalg.norm(half_b)
+        half_b = half_b / nb if nb > motion_gate else np.zeros_like(half_b)
+        return half_a, half_b
 
     def action_effect(self):
         """How much predicted Δcy varies across actions (normalized units).
@@ -218,6 +240,19 @@ class BehaviorClass:
         h = self._probes[0]
         preds = [float(self.predict(h, a)[1]) for a in range(self.res.num_actions)]
         return max(preds) - min(preds)
+
+    def free_motion(self):
+        """How much this class moves on its own (under the neutral action),
+        across the probe histories — the magnitude of Half B. Big for a fast
+        ball, medium for a ball-tracking opponent, ~0 for a static decoy.
+        Position-invariant (it is predicted displacement, not position).
+        Used to NAME passive sub-classes once they are separated."""
+        neutral = self.NEUTRAL_ACTION
+        mags = []
+        for h in self._probes:
+            d = self.predict(h, neutral)        # (Δcx, Δcy) under do-nothing
+            mags.append(float(np.linalg.norm(d)))
+        return float(np.mean(mags))
 
 
 # =====================================================================
@@ -258,16 +293,40 @@ class ObjectState:
             self.tentative.update(self.res.features(hist, action), target)
             self.n_obs += 1
 
-    def tentative_signature(self):
+    def tentative_signature_parts(self, motion_gate=1e-3):
+        """Same two-part fingerprint as BehaviorClass.signature_parts,
+        computed from the object's PRIVATE tentative W (before it is
+        bound/promoted). Used to compare a not-yet-confident object against
+        existing classes. Half A is RAW (matches the BIND_THRESH scale);
+        Half B is unit-normalized (zeros if free motion is ~0)."""
         neutral = self.res.num_actions - 1
-        sig = []
+        half_a = []
+        half_b = []
         for h in _probe_histories(self.res.delay):
             base = self.tentative.predict(self.res.features(h, neutral))
+            half_b.append(base)
             for a in range(self.res.num_actions):
                 if a == neutral:
                     continue
-                sig.append(self.tentative.predict(self.res.features(h, a)) - base)
-        return np.concatenate(sig)
+                half_a.append(
+                    self.tentative.predict(self.res.features(h, a)) - base)
+        half_a = np.concatenate(half_a)
+        half_b = np.concatenate(half_b)
+        nb = np.linalg.norm(half_b)
+        half_b = half_b / nb if nb > motion_gate else np.zeros_like(half_b)
+        return half_a, half_b
+
+    def free_motion(self):
+        """Tentative model's free-motion magnitude (mean predicted displacement
+        under the neutral action across probes). The Half B magnitude for a
+        not-yet-bound object; used to NAME passive sub-classes and to gate
+        Half B in the bracket-aware distance."""
+        neutral = self.res.num_actions - 1
+        mags = []
+        for h in _probe_histories(self.res.delay):
+            d = self.tentative.predict(self.res.features(h, neutral))
+            mags.append(float(np.linalg.norm(d)))
+        return float(np.mean(mags))
 
     def action_effect(self):
         """Tentative model's action-effect (range of predicted Δcy across
@@ -306,11 +365,19 @@ class ClassModel:
     """The top-level model half: discovered behavior classes."""
 
     GATE_OBS = 80          # observations before a tentative model is compared
-    BIND_THRESH = 0.06     # probe-prediction L2 below this -> bind to a class
-    MERGE_THRESH = 0.06    # probe-prediction L2 below this -> merge two classes
+    BIND_THRESH = 0.06     # signature distance below this -> bind to a class
+    MERGE_THRESH = 0.06    # signature distance below this -> merge two classes
     MERGE_PERIOD = 30      # frames between merge sweeps
     BRACKET_GATE = 0.005   # action-effect above this = "controlled" bracket
-    MERGE_PERIOD = 30      # frames between merge sweeps
+    # Half B (free motion) weight in the PASSIVE-only distance. Large enough
+    # that a stationary decoy (Half B = 0) vs a mover (Half B = unit) clears
+    # BIND_THRESH (~0.06), so passive sub-classes separate; small enough not
+    # to dominate. Tuned in test_perception.py CLAIM 4.
+    W_AUTONOMOUS = 0.15
+    # Free-motion magnitude below this = "effectively stationary" -> Half B
+    # is zeroed (the object is treated as a non-mover, e.g. a decoy). Above
+    # this, Half B is unit-normalized and participates in passive splitting.
+    PASSIVE_MOTION_GATE = 0.03
 
     def __init__(self, delay=3, num_actions=3, n_freq=2, cheb_degree=3,
                  forgetting=0.999, ridge_init=0.01):
@@ -339,19 +406,47 @@ class ClassModel:
                 and obj.n_obs >= self.GATE_OBS):
             self._try_bind_or_promote(obj)
 
+    def _is_controlled(self, c):
+        return c.action_effect() > self.BRACKET_GATE
+
+    def _signature_distance(self, parts_a, controlled_a, parts_b, controlled_b):
+        """Bracket-aware distance between two fingerprints (each = (half_a,
+        half_b)).
+
+        Half A (action-contrast, RAW) always counts — it carries the
+        controlled/passive split and controlled-class reuse on the original
+        BIND_THRESH=0.06 scale.
+
+        Half B (free motion, unit-normalized) counts ONLY when BOTH objects
+        are passive. Controlled objects' free-motion is spurious noise
+        comparable to real passive motion, so letting it participate in a
+        controlled-controlled comparison would break reuse. Within the
+        passive bracket, Half B is the signal that splits ball / opponent /
+        decoy (action-contrast is ~0 for all of them)."""
+        half_a1, half_b1 = parts_a
+        half_a2, half_b2 = parts_b
+        da = float(np.linalg.norm(half_a1 - half_a2))
+        if controlled_a or controlled_b:
+            return da                      # action-contrast only (original behavior)
+        db = float(np.linalg.norm(half_b1 - half_b2))
+        return da + self.W_AUTONOMOUS * db   # passive: add the free-motion term
+
     def _try_bind_or_promote(self, obj):
         # BRACKET rule: only bind to classes in the SAME action-effect bracket
         # (controlled vs passive). A controlled object must never bind to a
         # passive class, even if their signatures are close early on.
         t_controlled = obj.action_effect() > self.BRACKET_GATE
-        sig = obj.tentative_signature()
+        parts = obj.tentative_signature_parts(self.PASSIVE_MOTION_GATE)
         best_cid, best_d = None, 1e9
         for cid, c in self.classes.items():
             if c.n_obs < self.GATE_OBS:
                 continue
-            if (c.action_effect() > self.BRACKET_GATE) != t_controlled:
+            c_controlled = self._is_controlled(c)
+            if c_controlled != t_controlled:
                 continue  # different bracket -> never bind
-            d = float(np.linalg.norm(sig - c.signature()))
+            d = self._signature_distance(
+                parts, t_controlled,
+                c.signature_parts(self.PASSIVE_MOTION_GATE), c_controlled)
             if d < best_d:
                 best_d, best_cid = d, cid
         if best_cid is not None and best_d < self.BIND_THRESH:
@@ -378,19 +473,24 @@ class ClassModel:
     def _merge(self):
         # only merge classes in the SAME bracket (controlled with controlled,
         # passive with passive); never cross brackets. Same-bracket classes
-        # that are really one behavior (e.g. paddle fragments) consolidate.
+        # that are really one behavior (e.g. paddle fragments, or two ball
+        # fragments) consolidate. Distance is bracket-aware: passive classes
+        # also compare free motion (Half B) so ball/opp/decoy do NOT merge.
         cls = [c for c in self.classes.values() if c.n_obs >= self.GATE_OBS]
         if len(cls) < 2:
             return
-        sigs = {c.id: c.signature() for c in cls}
+        parts = {c.id: c.signature_parts(self.PASSIVE_MOTION_GATE) for c in cls}
+        controlled = {c.id: self._is_controlled(c) for c in cls}
         while True:
             best = None  # (a, b, dist)
             for i in range(len(cls)):
                 for j in range(i + 1, len(cls)):
                     a, b = cls[i], cls[j]
-                    if (a.action_effect() > self.BRACKET_GATE) != (b.action_effect() > self.BRACKET_GATE):
+                    if controlled[a.id] != controlled[b.id]:
                         continue  # different bracket
-                    d = float(np.linalg.norm(sigs[a.id] - sigs[b.id]))
+                    d = self._signature_distance(
+                        parts[a.id], controlled[a.id],
+                        parts[b.id], controlled[b.id])
                     if d < self.MERGE_THRESH and (best is None or d < best[2]):
                         best = (a, b, d)
             if best is None:
@@ -403,7 +503,8 @@ class ClassModel:
                     keep.n_bound += 1
             del self.classes[drop.id]
             cls.remove(drop)
-            del sigs[drop.id]
+            del parts[drop.id]
+            del controlled[drop.id]
 
     # ---- identity by behavior ----
     def controlled_class(self):
@@ -428,7 +529,8 @@ class ClassModel:
     def diagnostics(self):
         return {
             "classes": {cid: {"n_obs": c.n_obs, "n_bound": c.n_bound,
-                              "action_effect": c.action_effect()}
+                              "action_effect": c.action_effect(),
+                              "free_motion": c.free_motion()}
                         for cid, c in self.classes.items()},
             "objects": {tid: {"n_obs": o.n_obs, "bound": o.bound_class.id
                               if o.bound_class else None,

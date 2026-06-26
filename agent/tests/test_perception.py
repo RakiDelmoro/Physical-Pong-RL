@@ -243,6 +243,88 @@ def test_reuse_class_survives_object_swap():
         "discovered classes did not transfer knowledge")
 
 
+# ------------------------------ CLAIM 4 -------------------------------------
+
+def _bound_class_for_role(entry, role):
+    """Return the behavior-class id that the tracked object matching GT
+    `role` is bound to in this log entry, or None."""
+    tid = _track_at(entry["tracks"], entry["gt"][role])
+    if tid is None:
+        return None
+    o = entry["diag"]["objects"].get(tid)
+    return o["bound"] if o else None
+
+
+def _mature_passive_classes(entry):
+    """class ids that are passive (action_effect below the controlled bracket)
+    AND have enough observations to be trusted."""
+    BRACKET = 0.005
+    out = []
+    for cid, c in entry["diag"]["classes"].items():
+        if c["action_effect"] <= BRACKET and c["n_obs"] >= 80:
+            out.append(cid)
+    return out
+
+
+def test_passive_subclasses_separate():
+    """CLAIM 4: perception separates the passive bucket into distinct classes
+    for the BALL, the OPPONENT, and the DECOY (instead of lumping them as one
+    'passive' class). This is the upgrade: action-contrast alone gives ~0 for
+    every passive object, so the free-motion (autonomous dynamics) half of the
+    signature is what discriminates them.
+
+    We assert the robust, lighting-invariant facts:
+      - there are >= 3 mature passive classes at the end (ball / opp / decoy),
+      - each of the three passive roles is bound to a DISTINCT class,
+      - this still holds AFTER the 0.4x brightness shift.
+    We do NOT assert which free-motion magnitude is biggest (that ordering is
+    probe-dependent and not the point); we assert they are SEPARATED."""
+    log, perc = _run(total=300, shift=80, seed=1)
+    final = log[-1]
+
+    # the controlled paddle must still be identified (sanity: perception still
+    # works; we did not regress the controlled/passive split).
+    assert final["controlled"] is not None, "controlled paddle lost (regression)"
+
+    passive = _mature_passive_classes(final)
+    assert len(passive) >= 3, (
+        f"expected >=3 passive classes (ball/opp/decoy), got {len(passive)}: "
+        f"{[(cid, round(final['diag']['classes'][cid]['free_motion'],3)) for cid in passive]}")
+
+    roles = {r: _bound_class_for_role(final, r) for r in ("opp", "ball", "decoy")}
+    for r, cid in roles.items():
+        assert cid is not None, f"{r} not bound to any class at end"
+    distinct = set(roles.values())
+    assert len(distinct) == 3, (
+        f"ball/opp/decoy must be in 3 DISTINCT classes, got {roles}")
+
+    # none of the passive roles should be in the controlled class
+    cid_my = _bound_class_for_role(final, "my")
+    assert cid_my is not None and cid_my not in distinct, (
+        f"a passive role landed in the controlled class {cid_my}; roles={roles}")
+
+
+def test_passive_separation_holds_after_lighting_shift():
+    """CLAIM 4 (lighting invariance): the ball/opp/decoy separation survives
+    the 0.4x brightness shift — same bar the controlled-paddle tests meet.
+    Free motion is a behavioral signal, so a global brightness multiply must
+    not collapse the passive classes back together."""
+    log, perc = _run(total=300, shift=80, seed=1)
+    # check a window of frames well after the shift (shift at 80, run to 300)
+    held = False
+    for e in log[200:]:
+        passive = _mature_passive_classes(e)
+        if len(passive) < 3:
+            continue
+        roles = {r: _bound_class_for_role(e, r) for r in ("opp", "ball", "decoy")}
+        if None not in roles.values() and len(set(roles.values())) == 3:
+            held = True
+            break
+    assert held, (
+        "ball/opp/decoy separation did NOT hold after the 0.4x lighting shift; "
+        "free-motion identity failed the lighting-invariance bar")
+
+
 if __name__ == "__main__":
     log, perc = _run(total=240)
     f = log[-1]
