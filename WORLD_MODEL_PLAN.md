@@ -315,3 +315,62 @@ learner. The fix is more frames (the rig streams forever) or a smarter TD
     features, learned online by TD.
 
 Suite: 14 passed, 1 xfailed. No regressions, no dead code.
+
+## Next idea: DYNAMIC rollout (stop when imagination becomes unrealistic)
+
+INSIGHT: our W3 test demands a FIXED 25-step rollout, no matter what. Even
+if the imagined ball goes off-rails at frame 5 (flies through the paddle,
+zooms to x=3.0), the rollout KEEPS GOING to 25 -- piling nonsense on
+nonsense -- and the test then fails on the compounded garbage. A human
+imagining the future does NOT do this: "the ball flies straight... straight...
+reaches the paddle... and now I'm not sure, so I STOP." Imagination should
+be DYNAMIC -- the length is EARNED by realism, not fixed.
+
+WHY THIS IS RIGHT (not just a test tweak):
+  1. It matches how imagination is useful. A short, TRUSTWORTHY imagination
+     ("the ball reaches my paddle in ~6 frames") is more useful than a long,
+     garbage one. The Horde's forecasts care about the near, reliable future
+     most. A dynamic rollout gives exactly the horizon we can trust.
+  2. It sidesteps the W3 wall we kept hitting: every W3 failure was about
+     COMPOUNDING ERROR over 25 steps. Stop early when imagination goes off-
+     rails and we never reach the compounded-garbage regime -- we get a SHORT
+     HONEST rollout instead of a LONG DISHONEST one. The bounce doesn't need
+     to survive 25 steps; it needs to be real WHERE IT HAPPENS, then we stop.
+  3. It's how the Alberta Plan thinks about Dyna (Step 7): imagine UNTIL the
+     model's confidence runs out, prioritizing where imagination is reliable.
+     "Stop when unrealistic" is the natural stopping rule, not a fixed N.
+
+HOW 'UNREALISTIC' IS DETECTED (no Pong knowledge):
+  The world model already computes a SURPRISE = how far the imagined state
+  deviates from the physics default (the same signal used to detect real-
+  stream teleports/events). In imagination: when the imagined surprise crosses
+  a threshold (the imagined ball jumps, its velocity explodes, it goes off-
+  screen), STOP. Same mechanism, applied to imagined frames. General: "stop
+  imagining when your own prediction says 'I don't believe this anymore.'"
+  No Pong geometry; the detector is the model's own surprise statistic.
+
+WHAT CHANGES:
+  - rollout returns a VARIABLE-LENGTH trajectory: 6 frames on one run, 12 on
+    another, 25 only if the imagination stays realistic the whole way.
+  - W3 is rewritten: instead of "a 25-step rollout bounces," it becomes "the
+    rollout CONTINUES THROUGH a bounce (does not stop before it) AND the
+    bounce is real AT the step it happens." A more honest test of
+    'imagination works' than '25 steps and a flip.'
+
+HONEST CAVEAT: the underlying problem (the ball's velocity is wrong at the
+bounce, so the bounce signal is weak) does NOT go away -- the dynamic rollout
+just stops asking the model to be reliable PAST its breaking point. So it is a
+better TEST/USE of the rollout, and it may turn W3 green, but it is not a
+deeper fix. Frame it as: W3 was OVER-STRICT; a dynamic rollout is the honest
+version, and we should find out what it shows. The deeper fix (occlusion-
+velocity quality in perception) is still the real unblocker for sharp bounces.
+
+DO WE EVEN NEED ROLLOUT? For the core loop right now: NO. The Horde learns
+its forecasts directly from the live stream by TD (one step at a time, no
+imagination). W1/W2 are one-step. Rollout is only needed for the LATER
+boost -- Dyna (Step 7) / prioritized sweeping (Step 9), where the agent runs
+IMAGINED transitions to update the Horde FASTER than real time. That is a
+speedup, not a requirement for the core loop or for the next step (control,
+Step 4). So W3/dynamic-rollout is not blocking; it's a future boost we can do
+honestly with the dynamic version when we get to Dyna.
+
