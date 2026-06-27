@@ -270,52 +270,14 @@ def _camera_thread(cam_index, width, height, fps, focus, autofocus=False, backen
             _latest_jpeg = buf.tobytes()
         _latest_jpeg_event.set()
         if _show_preview:
+            # Raw camera only -- no screen detection, no warp, no overlay.
+            # This shows exactly what the perception model receives before
+            # any processing, so you can frame/position the camera and see
+            # what the rig actually looks like. The container's perception
+            # (screen warp + tracker + classes) is visualized separately via
+            # visualize_perception.py.
             try:
-                disp = frame.copy()
-                corners = detect_screen(frame)
-                if corners is not None:
-                    corners_i = corners.astype(np.int32)
-                    cv2.polylines(disp, [corners_i], True, (0, 255, 0), 3)
-                    cv2.putText(disp, "SCREEN DETECTED",
-                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                                1.2, (0, 255, 0), 3)
-                    # order corners TL/TR/BR/BL and warp to 128x128 -- this
-                    # is exactly what the container's ScreenWarper does, so
-                    # the preview shows what the NN will see.
-                    pts = corners.astype(np.float32)
-                    s = pts.sum(axis=1)
-                    d = pts[:, 0] - pts[:, 1]
-                    tl = pts[np.argmin(s)]
-                    br = pts[np.argmax(s)]
-                    tr = pts[np.argmax(d)]
-                    bl = pts[np.argmin(d)]
-                    ordered = np.array([tl, tr, br, bl], dtype=np.float32)
-                    dst = np.array([[0, 0], [127, 0], [127, 127], [0, 127]],
-                                   dtype=np.float32)
-                    H, _ = cv2.findHomography(ordered, dst, method=0)
-                    warped = cv2.warpPerspective(frame, H, (128, 128),
-                                                 flags=cv2.INTER_AREA)
-                    grey = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-
-                    # The NN's actual input: Otsu binarized greyscale
-                    # (matches agent.py _preprocess). Pure black/white --
-                    # glare (grey) becomes black, game elements stay white.
-                    # This is EXACTLY what the NN trains on.
-                    grey = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-                    _, binary = cv2.threshold(grey, 0, 255,
-                                              cv2.THRESH_BINARY
-                                              + cv2.THRESH_OTSU)
-                    nn_view = cv2.resize(binary, (480, 480),
-                                         interpolation=cv2.INTER_NEAREST)
-                    cv2.putText(nn_view, "WHAT THE NN SEES (binary 128x128)",
-                                (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                255, 1)
-                    cv2.imshow("NN view", nn_view)
-                else:
-                    cv2.putText(disp, "NO SCREEN (reposition)",
-                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                                1.2, (0, 0, 255), 3)
-                cv2.imshow("host_bridge camera preview", disp)
+                cv2.imshow("host_bridge camera preview (raw)", frame)
                 cv2.waitKey(1)
             except Exception:
                 pass

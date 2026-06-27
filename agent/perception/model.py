@@ -274,6 +274,12 @@ class ObjectState:
         self.tentative = OnlineRLS(reservoir.total_in, 2, forgetting, ridge_init)
         self.n_obs = 0
         self.confident = False
+        # The frame index of this object's last FRESH observation (set by
+        # ClassModel.observe each time a real, non-coasted position arrives).
+        # Used by class-binding persistence: when the track dies after a coast
+        # gap, a ghost records where it was last actually SEEN and the velocity
+        # then, so a reappearing track can be predicted forward correctly.
+        self.last_obs_frame = None
 
     def observe(self, new_pos, action):
         """Train on (last delay positions, action) -> DISPLACEMENT; remember it.
@@ -378,6 +384,35 @@ class ClassModel:
     # is zeroed (the object is treated as a non-mover, e.g. a decoy). Above
     # this, Half B is unit-normalized and participates in passive splitting.
     PASSIVE_MOTION_GATE = 0.03
+    # ---- class-binding persistence (Spelke persistence for the CLASS label) ----
+    # When a tracked object's track dies (lost or re-spawned under a new id),
+    # we keep a GHOST so a reappearing track can continue the object's
+    # identity instead of restarting the GATE_OBS probation from zero. Two
+    # kinds of ghost, both position-gated (they never fire on a fresh scene
+    # with no ghosts, so first-time binding is untouched):
+    #   * CLASS ghost (a bound object died): instant geometric inheritance --
+    #     a new track appearing where the dead object would be by now (predicted
+    #     pos within a TIGHT gate) inherits the class with zero probation.
+    #     Passive-only (never instantly inherit a controlled class).
+    #   * TENTATIVE ghost (a not-yet-bound learner died) + coasting adoption: a
+    #     new track appearing near where a dead/coasting learner was last SEEN
+    #     continues that learner's probation (carries the tentative RLS + n_obs).
+    #     This is the bootstrap for objects that churn before reaching GATE_OBS.
+    # Both are GEOMETRY-based. NOTE: they do NOT solve the reset case -- a ball
+    # that scores, teleports to center, and re-spawns under a new id breaks
+    # geometric continuity entirely. Cross-reset identity is handled on the
+    # WORLD-MODEL side (kind-speed slot merging), not here -- perception's
+    # class_id is too noisy for the churning ball to key on directly. The
+    # geometric paths here handle re-detection without a teleport (occlusions,
+    # brief tracking gaps, the real rig's messier churn).
+    GHOST_TTL = 40          # frames a ghost is eligible for inheritance
+    PERSIST_GATE = 0.08     # tight gate for instant geometric class inheritance
+    # gate for tentative-ghost REVIVAL: a new track reappears near where a
+    # dead (not-yet-bound) learner was last SEEN -> continue its probation.
+    # Matched on LAST-SEEN pos (not predicted) so it survives a bounce (the
+    # ball disappears into a paddle and reappears near the same spot). Loose
+    # enough to bridge a coast gap.
+    TENTATIVE_GATE = 0.18
 
     def __init__(self, delay=3, num_actions=3, n_freq=2, cheb_degree=3,
                  forgetting=0.999, ridge_init=0.01):
@@ -388,6 +423,11 @@ class ClassModel:
         self.objects = {}          # track_id -> ObjectState
         self._next_class_id = 1
         self._frame = 0
+        # class-binding persistence: ghost_id -> {class_id, pos, vel, frame}
+        # (one per dead bound object, evicted after GHOST_TTL frames or
+        # consumed when a new track inherits it).
+        self._ghosts = {}
+        self._next_ghost = 0
 
     def _new_object(self):
         o = ObjectState(self.res, self.forgetting, self.ridge_init)
@@ -398,12 +438,34 @@ class ClassModel:
     def observe(self, track_id, pos_norm, action):
         """Per-object, per-frame. pos_norm = [cx, cy] in [0,1]. action = int."""
         if track_id not in self.objects:
-            self.objects[track_id] = self._new_object()
+            obj = self._new_object()
+            self.objects[track_id] = obj
+            # Three persistence paths for a brand-new track, in order of
+            # strength (all ghost-gated; none fires on a fresh scene):
+            #   (a)  instant CLASS inheritance: reappeared where a dead BOUND
+            #        object would be by now (predicted pos, tight gate) ->
+            #        inherit its class, zero probation.
+            #   (a') tentative-ghost REVIVAL: a not-yet-bound learner died
+            #        nearby -> CONTINUE its probation under the new id. This
+            #        is the bootstrap: a fast bouncy object that churns before
+            #        ever reaching GATE_OBS otherwise never binds (its learner
+            #        resets every churn); revival lets it accumulate GATE_OBS
+            #        observations across churns and bind once.
+            if not self._inherit_by_geometry(obj, pos_norm):
+                self._revive_tentative(track_id, pos_norm)
+            obj = self.objects[track_id]
         obj = self.objects[track_id]
+        obj.last_obs_frame = self._frame
         obj.observe(pos_norm, action)
-        # try to bind / promote once the tentative model is confident
-        if (obj.bound_class is None and not obj.confident
-                and obj.n_obs >= self.GATE_OBS):
+        self._maybe_bind(obj)
+
+    def _maybe_bind(self, obj):
+        """Try to bind / promote once the tentative model is confident
+        (GATE_OBS observations -> compare against ALL classes; bind to a
+        matching one or promote a new class)."""
+        if obj.bound_class is not None or obj.confident:
+            return
+        if obj.n_obs >= self.GATE_OBS:
             self._try_bind_or_promote(obj)
 
     def _is_controlled(self, c):
@@ -459,16 +521,178 @@ class ClassModel:
             self._next_class_id += 1
 
     def retire(self, track_id):
-        """A track died — drop the object; decrement its class's bound count."""
+        """A track died — drop the object; decrement its class's bound count.
+
+        If it was bound, leave a GHOST so a reappearing track can inherit the
+        class (Spelke persistence for the learned class label). The ghost's
+        frame is the object's last FRESH observation frame (not the retire
+        frame), so predicted-position = last_pos + vel * frames-since-seen is
+        correct even after the coasting gap that preceded retirement."""
         obj = self.objects.pop(track_id, None)
-        if obj and obj.bound_class is not None:
+        if obj is None:
+            return
+        if obj.bound_class is not None:
             obj.bound_class.n_bound = max(0, obj.bound_class.n_bound - 1)
+            if len(obj.pos) >= 2 and obj.last_obs_frame is not None:
+                gid = self._next_ghost
+                self._next_ghost += 1
+                self._ghosts[gid] = {
+                    "kind": "class",
+                    "class_id": obj.bound_class.id,
+                    "pos": np.asarray(obj.pos[-1], dtype=np.float64),
+                    "vel": np.asarray(obj.pos[-1] - obj.pos[-2],
+                                       dtype=np.float64),
+                    "frame": obj.last_obs_frame,
+                }
+        elif obj.n_obs > 0 and obj.last_obs_frame is not None:
+            # TENTATIVE ghost: the object was still in its probation but had
+            # started learning. Keep its learner alive so a reappearing track
+            # CONTINUES the probation under a new id instead of restarting
+            # from zero. This is the bootstrap that lets a fast bouncy object
+            # (whose track churns before ever reaching GATE_OBS) accumulate
+            # enough observations to bind once. Matched by last-seen pos.
+            gid = self._next_ghost
+            self._next_ghost += 1
+            self._ghosts[gid] = {
+                "kind": "tentative",
+                "obj": obj,
+                "pos": np.asarray(obj.pos[-1], dtype=np.float64),
+                "frame": obj.last_obs_frame,
+            }
 
     def update(self):
-        """Once per frame: tick the merge cadence."""
+        """Once per frame: tick the merge cadence + evict stale ghosts."""
         self._frame += 1
         if self._frame % self.MERGE_PERIOD == 0:
             self._merge()
+        self._ghosts = {gid: g for gid, g in self._ghosts.items()
+                        if self._frame - g["frame"] <= self.GHOST_TTL}
+
+    # ---- class-binding persistence helpers (ghosts) ----
+    def _ghost_pred(self, g):
+        """Where a ghost would be NOW: last pos advanced by its velocity for
+        the frames since it was last freshly seen."""
+        dead = self._frame - g["frame"]
+        return g["pos"] + g["vel"] * dead
+
+    def _inherit_by_geometry(self, obj, pos):
+        """Path (a): instant class inheritance. If a recently-dead bound object
+        would be at `pos` by now (predicted pos within a TIGHT gate), the new
+        track IS that object -> inherit its class with no probation. Handles
+        re-detection where the object reappeared where it was expected (no
+        bounce). Returns True if a class was inherited."""
+        pos = np.asarray(pos, dtype=np.float64)
+        best_gid, best_d = None, self.PERSIST_GATE
+        for gid, g in self._ghosts.items():
+            if g.get("kind") != "class" or g["class_id"] not in self.classes:
+                continue
+            # safety: never INSTANTLY inherit a CONTROLLED class. A controlled
+            # object (a paddle) is big and slow, so it rarely churns and does
+            # not need this path; and a fast ball passing a near-stationary
+            # paddle's predicted position could otherwise wrongly grab the
+            # paddle's class. Controlled-class reuse goes through the signature
+            # fast-rebind path, which has a bracket check.
+            if self._is_controlled(self.classes[g["class_id"]]):
+                continue
+            d = float(np.linalg.norm(self._ghost_pred(g) - pos))
+            if d < best_d:
+                best_d, best_gid = d, gid
+        if best_gid is None:
+            return False
+        g = self._ghosts.pop(best_gid)   # consume the ghost
+        obj.bound_class = self.classes[g["class_id"]]
+        obj.confident = True
+        self.classes[g["class_id"]].n_bound += 1
+        return True
+
+    def _revive_tentative(self, track_id, pos):
+        """Path (a'): tentative-ghost REVIVAL. A not-yet-bound learner died
+        near `pos` -> continue its probation under the new track id. This is
+        the bootstrap for a fast bouncy object whose track churns before ever
+        reaching GATE_OBS: instead of resetting its learner every churn, the
+        SAME tentative RLS + n_obs carry across, so the object eventually
+        accumulates GATE_OBS observations and binds once.
+
+        Matched on LAST-SEEN pos (not velocity-predicted) within
+        TENTATIVE_GATE, because the whole point is to survive a bounce -- the
+        ball vanishes into a paddle and reappears near the same spot, which a
+        velocity prediction (that assumes no bounce) would miss. Returns True
+        if a learner was revived."""
+        pos = np.asarray(pos, dtype=np.float64)
+        best_gid, best_d = None, self.TENTATIVE_GATE
+        for gid, g in self._ghosts.items():
+            if g.get("kind") != "tentative":
+                continue
+            d = float(np.linalg.norm(g["pos"] - pos))
+            if d < best_d:
+                best_d, best_gid = d, gid
+        if best_gid is None:
+            return False
+        g = self._ghosts.pop(best_gid)   # consume the ghost
+        revived = g["obj"]
+        revived.pos = []                  # restart the position history at the
+                                         # new spot (the carried-over tentative
+                                         # RLS + n_obs are what persist)
+        self.objects[track_id] = revived
+        return True
+
+    def adopt_coasting_into_fresh(self, fresh_ids):
+        """If a coasting (unbound, not-observed-this-frame) learner sits near a
+        FRESH unbound object, the fresh object is almost certainly the same
+        physical object the tracker re-spawned under a new id (it failed to
+        re-match the coasting track -- e.g. the ball vanished into a paddle
+        on a bounce and reappeared). Transfer the coasting learner (tentative
+        RLS + accumulated n_obs) into the fresh object so its probation
+        CONTINUES instead of restarting from zero.
+
+        This is the bootstrap that lets a fast bouncy object -- whose track
+        churns every ~24 frames, well before GATE_OBS=80 -- accumulate enough
+        observations across churns to bind once. Without it, the learner
+        resets every churn and the object never binds (so no class is ever
+        created, so class-inheritance has nothing to inherit).
+
+        `fresh_ids` = track ids observed this frame (missed == 0). A COASTING
+        object is one in self.objects but not in fresh_ids (it is still alive
+        in the tracker, just unseen this frame); its last_obs_frame is older
+        than the current frame. Matched by last-seen pos within TENTATIVE_GATE."""
+        fresh_ids = set(fresh_ids)
+        coasting = [tid for tid, o in self.objects.items()
+                    if tid not in fresh_ids
+                    and o.bound_class is None and not o.confident
+                    and o.n_obs > 0 and o.pos
+                    and o.last_obs_frame is not None
+                    and o.last_obs_frame < self._frame]
+        if not coasting:
+            return
+        for ftid in fresh_ids:
+            fo = self.objects.get(ftid)
+            # ONLY adopt into a brand-new track that has not yet trained its
+            # own tentative model (n_obs == 0: it has < delay+1 positions, so
+            # its tentative RLS is still empty). Adopting into an established
+            # track would overwrite a real learner with a foreign one and
+            # corrupt that object's class -- the bug that broke controlled-
+            # paddle identity when adoption was unrestricted.
+            if (fo is None or fo.bound_class is not None or fo.confident
+                    or not fo.pos or fo.n_obs != 0):
+                continue
+            fpos = fo.pos[-1]
+            best_ctid, best_d = None, self.TENTATIVE_GATE
+            for ctid in coasting:
+                co = self.objects.get(ctid)
+                if co is None or not co.pos:
+                    continue
+                d = float(np.linalg.norm(co.pos[-1] - fpos))
+                if d < best_d:
+                    best_d, best_ctid = d, ctid
+            if best_ctid is None:
+                continue
+            co = self.objects.pop(best_ctid)
+            # the coasting learner carries the object's accumulated dynamics
+            # + probation credit; the fresh object keeps its current position
+            # history (so features re-form cleanly at the new spot).
+            fo.tentative = co.tentative
+            fo.n_obs = max(fo.n_obs, co.n_obs)
+            coasting.remove(best_ctid)
 
     def _merge(self):
         # only merge classes in the SAME bracket (controlled with controlled,

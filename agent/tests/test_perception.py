@@ -335,3 +335,54 @@ if __name__ == "__main__":
     print("objects:", {k: v for k, v in f["diag"]["objects"].items()})
     print("tracks:", [(t["id"], t["dim"], round(t["cx"]), round(t["cy"]))
                       for t in f["tracks"]])
+
+
+# ------------------------------ CLAIM 5 -------------------------------------
+# Class-binding persistence across a re-detection (Spelke persistence for the
+# learner). An object whose track is lost and re-spawned under a NEW id nearby
+# should CONTINUE its probation (carry the tentative learner + n_obs) instead
+# of restarting from zero -- the bootstrap for objects that churn before
+# reaching GATE_OBS. Tested directly on ClassModel so it is fast and isolated
+# from the tracker.
+
+def test_classmodel_revives_tentative_learner_across_re_detection():
+    """A not-yet-bound learner dies, then a new track appears near where it was
+    last seen -> the new track inherits the dead learner's probation credit
+    (n_obs) instead of restarting at 0. This is the geometric persistence path
+    that handles a brief occlusion / re-detection without a teleport."""
+    from agent.perception.model import ClassModel
+    cm = ClassModel()
+    # grow an unbound object at the center for several frames
+    for _ in range(20):
+        cm.observe(1, np.array([0.5, 0.5]), ACT_STAY)
+    n_before = cm.objects[1].n_obs
+    assert n_before > 0, "the learner did not accumulate observations"
+    # the track is lost -> retired. Records a TENTATIVE ghost (unbound, n_obs>0).
+    cm.retire(1)
+    assert 1 not in cm.objects, "retire did not drop the object"
+    assert any(g.get("kind") == "tentative" for g in cm._ghosts.values()), (
+        "retire did not leave a tentative ghost for the unbound learner")
+    # a new id reappears NEAR where the object was last seen -> revival
+    cm.observe(2, np.array([0.51, 0.5]), ACT_STAY)
+    assert 2 in cm.objects, "new track was not created"
+    n_after = cm.objects[2].n_obs
+    assert n_after >= n_before, (
+        f"revival did not carry probation credit: n_obs {n_after} < {n_before}; "
+        "the re-detected track restarted from zero instead of continuing the "
+        "dead learner's probation")
+
+
+def test_classmodel_revival_requires_proximity():
+    """Revival is GATED by proximity: a new track appearing far from any dead
+    learner starts fresh (n_obs == 0), so unrelated objects are not glued
+    together. The guard that keeps persistence honest."""
+    from agent.perception.model import ClassModel
+    cm = ClassModel()
+    for _ in range(20):
+        cm.observe(1, np.array([0.2, 0.5]), ACT_STAY)
+    cm.retire(1)
+    # new track far away (well outside TENTATIVE_GATE) -> no revival
+    cm.observe(2, np.array([0.8, 0.5]), ACT_STAY)
+    assert cm.objects[2].n_obs == 0, (
+        "a far-away new track inherited a dead learner's probation; the "
+        "proximity gate is not gating revival")

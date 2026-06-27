@@ -336,11 +336,14 @@ the ball." Identity by behavior, not by pixels.
 Front-load = meet the hard issue in its simplest form first, per the paper's
 strategy. ✅ = done, ⬜ = remaining.
 
-1. ✅ **Perception — scaffold + learned model + discovered behavior classes**
-   (§4, §7). Object tracker (persistence/cohesion/continuity/dimensionality)
-   + per-object reservoir+RLS model that *discovers* behavior classes by
-   action-contrast similarity. Lighting-invariant by construction. Tested in
-   sim (5/5) and validated on the real camera.
+1. ✅ **Perception — scaffold + learned model + discovered behavior classes
+   (incl. passive sub-classes)** (§4, §7). Object tracker
+   (persistence/cohesion/continuity/dimensionality) + per-object
+   reservoir+RLS model that *discovers* behavior classes via a two-part
+   signature: action-contrast (controlled vs passive) + a bracket-aware
+   autonomous-dynamics (free-motion) term that splits the passive bucket
+   into ball / opponent / decoy. Lighting-invariant by construction. Tested
+   in sim (7/7) and validated on the real camera.
 2. ⬜ **Unify the transition model** `M(s,a)→(s',r')` with reward predicted.
    (Alberta Plan Step 8b.) The keystone that unblocks real Dyna.
 3. ⬜ **Reframe predictors as a Horde of GVFs** on shared features.
@@ -444,11 +447,19 @@ is no servo in the loop yet, so no action→motion relationship to learn.
 
 - **Synthetic scene is clean; the real rig is messier.** Validated, not
   bulletproof: partial glare (not a global brightness multiply) is untested.
-- **Coarse classes.** It cleanly discovers *controlled vs passive*, but does
-  NOT yet separate the passive sub-classes (ball / opponent / decoy) — they
-  are lumped as "passive". The autonomous-dynamics part of the signature was
-  too noisy and was omitted. Discovering finer passive classes is a known
-  next step within perception.
+- **Finer passive classes (done; tested in sim).** It now separates the
+  passive bucket into distinct classes for ball / opponent / decoy, not just
+  *controlled vs passive*. The behavior signature gained a second,
+  unit-normalized **autonomous-dynamics (free-motion) half** — how an object
+  moves under the do-nothing action — which is the only signal that
+  discriminates passive sub-classes (action-contrast is ~0 for all of them).
+  The distance is **bracket-aware**: free motion participates only in
+  passive-vs-passive comparisons, never controlled-vs-controlled (a
+  controlled paddle's spurious free-motion is noise comparable to real
+  passive motion and would break controlled-class reuse). Proven in sim
+  (CLAIM 4: 3 distinct passive classes, each role in its own class, holds
+  across the 0.4× brightness shift). Still synthetic-only; real-rig tuning
+  (esp. faint ball / right paddle) remains open.
 - **Right paddle / ball detection on the real rig is weaker** than the left
   paddle (lower contrast on that side / small faint ball). A real-camera
   tuning issue, not a tracker bug.
