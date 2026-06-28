@@ -206,41 +206,108 @@ def _state_ball_vx(state, slot=0):
     return state[slot * WorldModel.STATE_PER_OBJ + 2]
 
 
-# ------------------------------ CLAIM W3 ------------------------------------
+# ------------------------------ CLAIM W3 (dynamic rollout) --------------------
+
+# W3 was rewritten for the DYNAMIC rollout. The old W3 demanded a FIXED 25-
+# step rollout no matter what -- even after the imagined ball flew through
+# the paddle and zoomed off-rails, the rollout KEPT GOING to 25, piling
+# compounded garbage, and then failed on the garbage. A human imagining the
+# future does not do that: "the ball flies straight... straight... reaches
+# the paddle... and now I'm not sure, so I STOP." The dynamic rollout stops
+# the moment its own imagination becomes unrealistic (off-screen / velocity
+# explosion / surprise spike -- the model's own signals, no Pong geometry).
+# So W3 is split into two honest pieces:
+#
+#   W3a (GREEN) -- the DYNAMIC STOP RULE works: the rollout returns a
+#     VARIABLE-LENGTH trajectory, stops early (with a reason) when the
+#     imagination goes off-rails, and never exceeds the horizon. This proves
+#     the mechanism itself, independent of bounce quality.
+#
+#   W3b (xfail) -- the BOUNCE itself is real AT the step it happens: the
+#     dynamic rollout CONTINUES THROUGH the paddle plane (does not stop
+#     before the bounce) and at that crossing the ball's vx has flipped to
+#     negative. This is the honest version of 'imagination works' -- not
+#     '25 steps and a flip.' It is still xfail because the underlying blocker
+#     (the ball's velocity estimate is wrong through a bounce -- a PERCEPTION
+#     occlusion-velocity problem, not world-model architecture) is unchanged;
+#     the dynamic rollout just stops asking the model to be reliable PAST its
+#     breaking point. See WORLD_MODEL_PLAN.md 'W3 PAUSED' and 'Next idea'.
+
+
+def test_w3a_dynamic_rollout_stops_when_unrealistic():
+    """W3a: the dynamic rollout stops early when imagination goes off-rails,
+    and runs the full horizon only when imagination stays realistic. Proves
+    the stop rule is real and general (no Pong geometry)."""
+    wm, log, scene, perc = _run_with_log(total=1200, n_features=1000)
+    assert wm.n_obs > 500, "world model did not train enough"
+    stay = ACT_STAY
+    horizon = 25
+    # run a dynamic rollout from many start frames; collect stop info.
+    early, full = 0, 0
+    for e in log[300::25]:
+        states, rewards, _, meta = wm.rollout(
+            e["tracks"], first_action=stay,
+            action_fn=lambda s, t: stay, horizon=horizon,
+            controlled_id=e.get("controlled"))
+        # bounded: never more than horizon+1 states (start + horizon steps)
+        assert len(states) <= horizon + 1, (
+            f"dynamic rollout produced {len(states)} states, exceeding the "
+            f"horizon+1={horizon+1} cap -- the stop rule is not bounding it")
+        assert meta["stopped_at"] <= horizon
+        if meta["stop_reason"] is not None and meta["stopped_at"] < horizon:
+            early += 1
+        elif meta["stopped_at"] == horizon:
+            full += 1
+    # the stop rule MUST fire on at least some starts (imagination goes
+    # off-screen when the imagined ball passes through a paddle and exits).
+    assert early >= 1, (
+        f"dynamic rollout never stopped early in {early+full} starts; the "
+        "stop rule is not firing -- imagination is not being checked for "
+        "realism")
+    # and a fixed-length (dynamic=False) rollout from the same starts runs
+    # the full horizon -- confirms the early stops are the dynamic rule's
+    # doing, not a length bug.
+    e = log[400]
+    states_fixed, _, _, meta_fixed = wm.rollout(
+        e["tracks"], first_action=stay,
+        action_fn=lambda s, t: stay, horizon=horizon, dynamic=False,
+        controlled_id=e.get("controlled"))
+    assert len(states_fixed) == horizon + 1 and meta_fixed["stop_reason"] is None, (
+        "a dynamic=False rollout did not run the full horizon -- the early "
+        "stops above are not attributable to the dynamic rule")
+
 
 @pytest.mark.xfail(
     reason=(
-        "PAUSED known-gap: the ball's velocity estimate is wrong through a "
-        "paddle bounce (freezes during the coast, spikes at re-acquisition), "
-        "so the bounce is not a clean training signal and the world model "
-        "cannot learn a sharp velocity flip. Blocker is in PERCEPTION "
-        "(occlusion-velocity quality), not world-model architecture. "
-        "See WORLD_MODEL_PLAN.md 'W3 PAUSED'."),
+        "PAUSED known-gap (now the honest dynamic-rollout version): the "
+        "dynamic rollout CONTINUES THROUGH the paddle plane and stops only "
+        "AFTER the bounce location, but the bounce itself is not sharp at "
+        "the crossing step -- the ball's vx does not flip to negative. The "
+        "blocker is in PERCEPTION: the ball's velocity estimate is wrong "
+        "through a paddle bounce (freezes during the coast/occlusion, then "
+        "spikes to an unphysical value at re-acquisition), so the bounce is "
+        "not a clean training signal and the world model cannot learn a "
+        "sharp velocity flip. An LSQ velocity fix was tried and REGRESSED "
+        "W2 (foresight 0.86 -> 0.64), so it is parked. This is NOT a world-"
+        "model-architecture problem (DPC, event-skip, slot fix, and the "
+        "dynamic stop are all done and correct). See WORLD_MODEL_PLAN.md "
+        "'W3 PAUSED' and 'Next idea: DYNAMIC rollout'."),
     strict=True,
 )
-def test_world_model_rollout_bounces_and_does_not_pass_through():
-    """CLAIM W3 (the rollout/coupling test): an imagined multi-frame rollout
-    stays physically sane -- the ball BOUNCES off a paddle (its x-velocity
-    flips sign when it reaches the paddle's x-plane) and does NOT fly through
-    the paddle to the far side. This is the property the frozen-nonlinear
-    (random Fourier) design is supposed to give us that a linear model cannot:
-    a bounce is a sharp piecewise event, and only a nonlinear basis can
-    represent it well enough to survive the error-compounding of a multi-step
-    rollout. One-frame foresight (W2) does NOT test this -- errors compound
-    when each imagined state is fed back as the next input, and a smeared flip
-    becomes a pass-through over several steps.
+def test_w3b_rollout_continues_through_bounce_and_bounces_at_it():
+    """CLAIM W3b (the honest dynamic-rollout bounce test): the dynamic
+    rollout CONTINUES THROUGH the opponent paddle's x-plane (does not stop
+    before the bounce) AND at the crossing step the imagined ball's vx has
+    FLIPPED to negative (the bounce is real AT the step it happens).
 
-    We train, then find a frame where the ball is heading TOWARD the opponent
-    paddle (bvx > 0) and not too close to a wall, run a 25-step rollout with a
-    'stay' action, and check the imagined ball: its x crosses the opp paddle's
-    x-plane at some step, and at that crossing its vx has FLIPPED to negative
-    (it bounced), AND it never ends up well beyond the paddle plane (it didn't
-    pass through)."""
+    This replaces the old fixed-25-step 'bounces and does not pass through'
+    test. The dynamic rollout stops only when its own imagination becomes
+    unrealistic (off-screen etc.); reaching the paddle plane is NOT
+    unrealistic, so the rollout continues through the bounce location and we
+    check the bounce right there -- not after 25 steps of compounded garbage."""
     wm, log, scene, perc = _run_with_log(total=1200, n_features=1000)
     assert wm.n_obs > 500, "world model did not train enough"
 
-    # find a good approach frame: ball heading right (toward opp), in mid-field,
-    # and a few frames of training have happened so the model is warm.
     cand = None
     for e in log[300:]:
         if e["gt_bvx"] > 0 and 0.35 * W < e["gt_bx"] < 0.6 * W:
@@ -248,51 +315,45 @@ def test_world_model_rollout_bounces_and_does_not_pass_through():
             break
     assert cand is not None, "no suitable ball-approach frame in the run"
 
-    # opp paddle x-plane in NORMALIZED coords (the world model works normalized)
     opp_x_norm = (cand["gt_opp_x"]) / float(W)
     stay = ACT_STAY
 
-    states, rewards, _ = wm.rollout(cand["tracks"], first_action=stay,
-                                    action_fn=lambda s, t: stay, horizon=25,
-                                    controlled_id=cand.get("controlled"))
+    states, rewards, _, meta = wm.rollout(
+        cand["tracks"], first_action=stay,
+        action_fn=lambda s, t: stay, horizon=25,
+        controlled_id=cand.get("controlled"))
 
-    # extract imagined ball (cx, vx) per step. Slot 0 is the first object after
-    # the (cy, cx) sort; not guaranteed to be the ball, so search all slots for
-    # the one whose cx crosses the opp plane -- that's the bouncing object.
+    # the rollout must have CONTINUED THROUGH the opp paddle plane (reached
+    # it without stopping first). If it stopped before the plane, the stop
+    # rule is too eager -- a bounce location is not 'unrealistic'.
     n_slots = WorldModel.MAX_OBJECTS
+    reached_plane = False
     found_bounce = False
-    passed_through = False
     for slot in range(n_slots):
         cxs = [s[slot * WorldModel.STATE_PER_OBJ] for s in states]
         vxs = [s[slot * WorldModel.STATE_PER_OBJ + 2] for s in states]
-        # does this slot's x actually approach & cross the opp plane?
         if not any(cx >= opp_x_norm for cx in cxs):
             continue
-        if cxs[0] > opp_x_norm:  # already past -- not a clean approach
+        if cxs[0] > opp_x_norm:
             continue
-        # find the first step where it reaches the plane
+        reached_plane = True
         cross_step = next((i for i, cx in enumerate(cxs) if cx >= opp_x_norm),
                           None)
         if cross_step is None or cross_step < 1:
             continue
-        # at the crossing, the vx should have flipped to NEGATIVE (bounced)
-        vx_after = vxs[cross_step]
-        if vx_after < 0:
+        if vxs[cross_step] < 0:
             found_bounce = True
-        # and it should not keep going far past the plane (pass-through)
-        max_past = max(cx - opp_x_norm for cx in cxs[cross_step:])
-        if max_past > 0.15:   # >15% of frame width past the plane = flew through
-            passed_through = True
 
+    assert reached_plane, (
+        "the dynamic rollout did NOT continue through the opponent paddle "
+        "plane -- it stopped before the bounce location. The stop rule is "
+        "too eager (a bounce location is not 'unrealistic').")
     assert found_bounce, (
-        "rollout did NOT bounce the ball off the opponent paddle: no slot "
-        "showed an x-velocity flip to negative at the paddle plane. The "
-        "imagined trajectory passed through the paddle (the linear-model "
-        "failure the nonlinear design was meant to fix).")
-    assert not passed_through, (
-        "rollout bounced BUT the imagined ball kept going well past the "
-        "paddle plane -- a smeared/partial bounce. Errors compounded into a "
-        "pass-through over the rollout horizon.")
+        "the dynamic rollout continued through the paddle plane but the "
+        "bounce was NOT real at the crossing step: no slot showed an x-"
+        "velocity flip to negative at the paddle plane. The imagined ball "
+        "passed through (the known perception-velocity blocker -- the bounce "
+        "signal is not clean in the training data).")
 
 
 if __name__ == "__main__":

@@ -542,7 +542,13 @@ class WorldModel:
             next_hx = self._higher(self._state_t(state), regime)
         if hx is None:
             return next_state, pred_r
-        return next_state, pred_r, next_hx
+        # in rollout mode, also return the imagined SURPRISE = the norm of the
+        # learned correction (the deviation from the physics default) -- the
+        # same signal used to detect real-stream events, applied to an imagined
+        # frame so the dynamic rollout can stop when its own imagination is
+        # no longer believable.
+        corr_norm = float(np.linalg.norm(pred_corr))
+        return next_state, pred_r, next_hx, corr_norm
 
     def predict_reward(self, tracks, action, controlled_id=None):
         """Predict the reward_delta following this (state, action). The
@@ -557,30 +563,83 @@ class WorldModel:
         nxt, _ = self._predict(s, action)
         return nxt
 
+    # ---- the dynamic-rollout stop rule (no Pong geometry) ----
+    def _is_unrealistic(self, state, corr_norm):
+        """Is this IMAGINED state believable? Returns (bool, reason).
+
+        General signals -- nothing here knows it is Pong:
+          (a) OFF-SCREEN: an object's position leaves the normalized frame
+              (with a small margin). "An object left the world."
+          (b) VELOCITY EXPLOSION: some velocity magnitude is implausibly
+              large vs normalized units. "Something moves impossibly fast."
+          (c) SURPRISE SPIKE: the imagined correction -- the deviation from
+              the physics default, the SAME surprise statistic used to detect
+              real-stream events -- far exceeds the model's own typical motion
+              scale (median + 12*MAD). "The model does not believe its own
+              imagination anymore."
+        This is the honest stopping rule: imagination continues only as long
+        as the model's own signals say it is still realistic."""
+        pos = state[:self.pos_dim]
+        if np.any(pos < -0.05) or np.any(pos > 1.05):
+            return True, "off_screen"
+        vel = state[self.pos_dim:self.pos_dim + self.vel_dim]
+        if np.max(np.abs(vel)) > 0.3:
+            return True, "velocity_explosion"
+        med, mad = self._surprise_median_mad()
+        if med is not None and corr_norm > med + 12.0 * mad:
+            return True, "surprise_spike"
+        return False, None
+
     def rollout(self, tracks, first_action, action_fn, horizon=20,
-                controlled_id=None):
-        """Imagine `horizon` frames forward from the current state. Each
-        imagined step = physics_default + regime-modulated correction. The
-        regime is carried forward in the imagined future (the higher level
-        fires on the imagined approach pattern -- this is what makes an
-        imagined bounce sharp). All in the agent's head; the servo never moves.
+                controlled_id=None, dynamic=True):
+        """Imagine forward from the current state. Each imagined step =
+        physics_default + regime-modulated correction; the regime is carried
+        forward in the imagined future (the higher level fires on the imagined
+        approach pattern -- this is what makes an imagined bounce sharp).
+        All in the agent's head; the servo never moves.
+
+        DYNAMIC rollout (the honest version of imagination): STOP as soon as
+        the imagination becomes unrealistic, detected by the model's own
+        signals (see _is_unrealistic) -- no Pong geometry. The length is
+        EARNED by realism, not fixed: a short trustworthy trajectory beats a
+        long dishonest one. This is how the Alberta Plan's Dyna (Step 7)
+        actually imagines -- until the model's confidence runs out -- and it
+        sidesteps the compounding-error wall the fixed-length W3 kept hitting:
+        we never reach the compounded-garbage regime, we get a SHORT HONEST
+        rollout instead. A human imagining the future does this: "the ball
+        flies straight... straight... reaches the paddle... and now I'm not
+        sure, so I stop."
 
         first_action : action at the FIRST imagined step.
         action_fn(s, t) -> action : chooses each subsequent imagined action.
+        dynamic : if True (default), stop on unrealistic imagination; if False,
+          run the full `horizon` (the old fixed-length behavior, kept for
+          comparison / diagnostics).
 
-        Returns (list of imagined states, list of imagined rewards, cumulative
-        reward)."""
+        Returns (states, rewards, cumulative_reward, meta) where meta =
+        {"stop_reason": str|None, "stopped_at": int} -- stopped_at is the
+        number of imagined steps taken (== horizon if it ran the full way).
+        states always includes the starting state, so len(states) ==
+        stopped_at + 1."""
         s = self.state_from_tracks(tracks, controlled_id)
         states = [s.copy()]
         rewards = []
         a = int(first_action)
         hx = self._hx
+        stop_reason = None
+        t = 0
         for t in range(horizon):
-            s, r, hx = self._predict(s, a, hx=hx)
+            s, r, hx, corr_norm = self._predict(s, a, hx=hx)
             states.append(s.copy())
             rewards.append(float(r))
+            if dynamic:
+                bad, why = self._is_unrealistic(s, corr_norm)
+                if bad:
+                    stop_reason = why
+                    break
             a = int(action_fn(s, t))
-        return states, rewards, float(np.sum(rewards))
+        meta = {"stop_reason": stop_reason, "stopped_at": t + 1}
+        return states, rewards, float(np.sum(rewards)), meta
 
     def diagnostics(self):
         return {

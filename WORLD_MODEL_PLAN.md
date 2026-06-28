@@ -316,7 +316,7 @@ learner. The fix is more frames (the rig streams forever) or a smarter TD
 
 Suite: 14 passed, 1 xfailed. No regressions, no dead code.
 
-## Next idea: DYNAMIC rollout (stop when imagination becomes unrealistic)
+## Next idea: DYNAMIC rollout (stop when imagination becomes unrealistic)  [DONE]
 
 INSIGHT: our W3 test demands a FIXED 25-step rollout, no matter what. Even
 if the imagined ball goes off-rails at frame 5 (flies through the paddle,
@@ -373,4 +373,38 @@ IMAGINED transitions to update the Horde FASTER than real time. That is a
 speedup, not a requirement for the core loop or for the next step (control,
 Step 4). So W3/dynamic-rollout is not blocking; it's a future boost we can do
 honestly with the dynamic version when we get to Dyna.
+
+## Implementation  [DONE]
+
+`rollout(dynamic=True)` now returns a VARIABLE-LENGTH trajectory + a
+`meta={"stop_reason", "stopped_at"}`. The stop rule is the model's OWN
+signals (no Pong geometry): (a) OFF-SCREEN -- an object position leaves the
+normalized frame; (b) VELOCITY EXPLOSION -- a velocity magnitude becomes
+implausible; (c) SURPRISE SPIKE -- the imagined correction (deviation from
+the physics default, the SAME statistic used to detect real-stream events)
+fars exceeds the model's own median+12*MAD motion scale. "Stop imagining
+when your own prediction says 'I don't believe this anymore.'"
+
+W3 was split into two honest pieces:
+  - W3a (GREEN) `test_w3a_dynamic_rollout_stops_when_unrealistic`: the stop
+    rule fires on some starts (imagination goes off-screen when the imagined
+    ball passes through a paddle and exits), never exceeds the horizon, and a
+    dynamic=False rollout from the same start runs the full horizon -- proves
+    the early stops are the dynamic rule's doing, not a length bug.
+  - W3b (xfail, honest) `test_w3b_rollout_continues_through_bounce_and_
+    bounces_at_it`: the dynamic rollout CONTINUES THROUGH the paddle plane
+    (does not stop before the bounce) AND at the crossing step the ball's vx
+    has flipped to negative. It still xfails because the bounce itself is not
+    sharp at the crossing -- the PERCEPTION velocity blocker is unchanged.
+
+HONEST RESULT: the dynamic rollout is a better TEST/USE of imagination (W3a
+is green; W3b is now the honest 'does the bounce work at the step it
+happens' instead of the over-strict '25 steps and a flip'). It did NOT turn
+W3b green, exactly as the caveat above predicted -- the underlying
+velocity-quality problem at bounces does not go away; the dynamic rollout
+just stops asking the model to be reliable PAST its breaking point. The
+deep fix (occlusion-velocity quality in perception, without regressing W2)
+is still the real unblocker for sharp bounces.
+
+Suite: 15 passed, 1 xfailed. No regressions.
 
