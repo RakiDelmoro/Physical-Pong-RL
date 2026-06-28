@@ -336,6 +336,45 @@ forever). W3b stays xfail honestly; the loop stays (it is a genuine
 improvement and on-plan) and will be re-measured once the rig streams longer
 or a clean estimator lands.
 
+### 'More frames' experiment  [DONE; path 1 is DEAD, measured]
+
+Ran the loop at 1200 / 3000 / 5000 frames and measured W2 and the bounce
+flip-rate directly. Result:
+  - W2 degrades with more frames: 0.857 -> 0.781 -> 0.725. Checked WITHOUT
+    the hint too: identical at 1200/3000, ~same at 5000. So the degradation
+    is NOT the hint's fault -- it is long-run drift in the world model's net
+    (plain Adam, NO weight decay / no forgetting on the learned net; the
+    `forgetting=0.999` ctor arg is a leftover from the RLS era and only
+    affects the Horde's readouts, not the world model). A SEPARATE pre-
+    existing issue, not caused by this work.
+  - W3b flip-rate stayed ~0 at all frame counts. More frames did NOT help.
+
+Diagnosed why, directly: at a clean approach frame (GT ball at cx=0.500
+heading right at +0.014), there is NO perception track at the ball's
+position. The ball's identity is LOST -- a ghost track (id=12) is coasting
+for 10 frames drifting from cx=0.118 to cx=-0.045 (OFF SCREEN), and the
+model-assisted hint is happily driving that ghost left (it returns
+hint_vx=-0.0165 for the ghost). The actual ball has no track; the world
+model's state has no ball at 0.500; the rollout bounces nothing.
+
+CONCLUSION: path 1 (more frames) is conclusively DEAD. The blocker is NOT a
+dirty brain needing more data -- it is PERCEPTION IDENTITY LOSS: when the
+ball's blob merges with a paddle, perception loses the ball's track entirely
+and a wrong ghost takes its slot. No amount of training teaches a model to
+bounce a ball that IS NOT IN ITS INPUT. The model-assisted coast helps a
+CORRECT coasting track; it cannot resurrect a track that was never the ball.
+
+The real unblocker is a PERCEPTION IDENTITY-THROUGH-CONTACT fix: when the
+ball merges with a paddle, perception must KEEP a track at the ball's true
+(occluded) position (model-assisted, so it drifts to where the ball actually
+is, not off-screen) so it re-acquires the RIGHT object on separation. This is
+a different and larger fix than velocity estimation -- it is about keeping
+the ball's IDENTITY alive through contact, not just its velocity. It is also
+the Spelke-object principle the perception module already leans on ('objects
+persist') extended to 'objects persist THROUGH CONTACT', which is exactly
+where it currently breaks. The model-assisted coast we built is HALF of this
+fix (it carries velocity); the missing half is carrying POSITION/IDENTITY.
+
 ## What's unblocked next: the Horde (Step 3)  [DONE]
 
 The Horde is built and validated (`agent/horde.py`, `agent/tests/test_horde.py`).
