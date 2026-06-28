@@ -648,8 +648,9 @@ class WorldModel:
     # "what will happen next" and "what is each object".
     CONTROLLED_WARMUP = 200   # frames before the controlled-object query is
                               # trusted (need enough history for a correlation)
-    CONTROLLED_CORR_GATE = 0.05  # min |corr(action, slot_vy)| to call a slot
-                                 # controlled (below this = passive / no signal)
+    CONTROLLED_CORR_GATE = 0.05  # min |corr| to NEWLY call a slot controlled
+    CONTROLLED_HOLD_GATE = 0.02  # below this, an existing controlled slot is
+                                 # dropped (hysteresis: commit high, hold low)
     CORR_HIST = 80             # length of the dedicated correlation history
 
     def controlled_track(self, tracks):
@@ -700,22 +701,43 @@ class WorldModel:
         # delta tracks the action; passive slots' deltas don't. We take the
         # max over both cx and vy correlation to stay general ('the position
         # component that tracks the action').
+        # per-slot correlation with the action (max over cx/cy deltas).
+        slot_corr = np.zeros(self.MAX_OBJECTS)
         best_slot, best_corr = None, 0.0
         for slot in range(self.MAX_OBJECTS):
             j = slot * self.STATE_PER_OBJ
             dxs = np.array([hist[i + 1][j] - hist[i][j] for i in range(n - 1)])
             dys = np.array([hist[i + 1][j + 1] - hist[i][j + 1]
                             for i in range(n - 1)])
+            c_slot = 0.0
             for d in (dxs, dys):
                 d = d - d.mean()
                 vd = float(np.sqrt((d ** 2).sum()))
                 if vd < 1e-9:
                     continue
                 corr = abs(float((d * act_signed).sum() / (vd * denom)))
-                if corr > best_corr:
-                    best_corr, best_slot = corr, slot
-        if best_slot is None or best_corr < self.CONTROLLED_CORR_GATE:
-            return None   # nothing's motion tracks the action enough
+                c_slot = max(c_slot, corr)
+            slot_corr[slot] = c_slot
+            if c_slot > best_corr:
+                best_corr, best_slot = c_slot, slot
+        if best_slot is None:
+            return None
+        # HYSTERESIS (commit-and-hold): the controlled object is a PERSISTENT
+        # property (the paddle I control does not change frame to frame), so
+        # once a controlled slot is set we HOLD it unless its correlation
+        # drops below a LOWER threshold. This stops the per-frame flips (a
+        # noisy 80-frame correlation window oscillates ~77% correct without
+        # this) that corrupted the slot assignment and hurt W2/Horde. NOT the
+        # old heuristic tower -- a single commit/hold rule with two thresholds.
+        if self._controlled_slot is not None:
+            held_corr = slot_corr[self._controlled_slot]
+            if held_corr >= self.CONTROLLED_HOLD_GATE:
+                best_slot = self._controlled_slot   # hold the committed slot
+            # else: the committed slot's correlation collapsed -> switch to the
+            # new best (which already cleared best_corr by definition)
+        else:
+            if best_corr < self.CONTROLLED_CORR_GATE:
+                return None   # nothing reacts enough to NEWLY commit
         self._controlled_slot = best_slot
         for tid, sl in self._slot_map.items():
             if sl == best_slot and any(t["id"] == tid for t in tracks):
