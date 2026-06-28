@@ -228,6 +228,14 @@ class WorldModel:
                                                  n_features=64, gamma=gamma,
                                                  seed=seed + 1)
         self._state_hist = []   # list of recent states (np arrays) for rollout
+        self._action_hist = []  # aligned action history (for the controlled-
+                                # object correlation query; see controlled_track)
+        # a SEPARATE, longer history for the controlled-object correlation
+        # query (the DPC higher level's _state_hist is only HIST_LEN=8, too
+        # short to measure an action-velocity correlation; the class model
+        # used 80). Does not touch the DPC higher level.
+        self._corr_hist = []     # recent states for the correlation query
+        self._corr_acts = []     # aligned actions
         self._last_state = None
         self._last_action = None
         self.n_obs = 0
@@ -385,10 +393,21 @@ class WorldModel:
         the higher-level regime modulation. Online, one update per frame."""
         reward_delta = float(reward_delta)
         cur_state = self.state_from_tracks(tracks, controlled_id)
-        # maintain the state history for the higher level
+        # maintain the state + action histories for the higher level and for
+        # the controlled-object correlation query (controlled_track).
         self._state_hist.append(cur_state.copy())
+        self._action_hist.append(int(action))
         if len(self._state_hist) > self.HIST_LEN:
             self._state_hist.pop(0)
+        if len(self._action_hist) > self.HIST_LEN:
+            self._action_hist.pop(0)
+        # the dedicated longer correlation history
+        self._corr_hist.append(cur_state.copy())
+        self._corr_acts.append(int(action))
+        if len(self._corr_hist) > self.CORR_HIST:
+            self._corr_hist.pop(0)
+        if len(self._corr_acts) > self.CORR_HIST:
+            self._corr_acts.pop(0)
         if self._last_state is not None and self._last_action is not None:
             default_next = self._physics_default(self._last_state)
             residual = cur_state - default_next
@@ -616,6 +635,92 @@ class WorldModel:
         s = self.state_from_tracks(tracks, controlled_id)
         nxt, _ = self._predict(s, action)
         return nxt
+
+    # ---- OPTION C: the world model IS the labeler (no separate class model).
+    # "Which object am I controlling?" and "which objects behave the same
+    # way?" are DYNAMICS questions, and the world model already learns each
+    # object's dynamics. So we read the labels off the world model by ASKING
+    # it, instead of maintaining a separate labeler with a fragile tower of
+    # persistence heuristics (ghosts / revival / binding / merging) that was
+    # coupled to the old association and broke when we rewired the scaffold.
+    # The Alberta Plan's own move: dissolve the perception/labeling chicken-
+    # and-egg -- one learned surface (the dynamics model) answers both
+    # "what will happen next" and "what is each object".
+    CONTROLLED_WARMUP = 200   # frames before the controlled-object query is
+                              # trusted (need enough history for a correlation)
+    CONTROLLED_CORR_GATE = 0.05  # min |corr(action, slot_vy)| to call a slot
+                                 # controlled (below this = passive / no signal)
+    CORR_HIST = 80             # length of the dedicated correlation history
+
+    def controlled_track(self, tracks):
+        """Discover the controlled object from the world model's OWN history:
+        the slot whose velocity CORRELATES most with the action over time is
+        the object my action moves. Returns the TRACK ID of that slot (mapped
+        back via the slot map), or None if cold / no slot clears the gate.
+
+        This is the on-plan replacement for the class model's
+        `controlled_object`: same question ('which object does my action
+        affect?'), answered from the dynamics data the world model already
+        aggregates (its state + action history), with NO separate labeler,
+        NO ghosts, NO binding probation. The slot assignment already keeps
+        per-object identity stable across re-detection, so the 'carry the
+        label across churn' heuristics have no job -- the slot IS the
+        persistent identity. GENERAL: 'which slot's motion correlates with my
+        action' is true in any world where an action affects one object; no
+        Pong vocabulary.
+
+        HONEST DESIGN NOTE: the naive 'run M(s,UP) vs M(s,DOWN) and subtract'
+        does NOT work for this architecture, because the action's effect is
+        mediated through the STATE's velocity (perception measures the
+        paddle's motion frame-to-frame; that velocity is what M advances via
+        the physics default), not through the action INPUT to M. Same state
+        -> same prediction regardless of the action input, so the
+        single-frame contrast is ~0. The TIME CORRELATION over history is the
+        correct query: it asks 'does this object MOVE when I act?', which is
+        exactly the dynamics question, measured on the world model's own data.
+        """
+        if self.n_obs < self.CONTROLLED_WARMUP:
+            return None   # cold -- not enough history for a correlation
+        hist = self._corr_hist
+        acts = self._corr_acts
+        n = len(hist)
+        if n < 30 or len(acts) < n:
+            return None
+        # the action signal: UP=+1, DOWN=-1, STAY=0 (the signed scalar that
+        # actually drives the paddle). Stated in discovered terms -- we use the
+        # action's signed effect, not a hardcoded 'paddle index'.
+        act_signed = np.array(acts[:-1], dtype=np.float64)   # aligned with deltas
+        act_signed = act_signed - act_signed.mean()
+        denom = float(np.sqrt((act_signed ** 2).sum()))
+        if denom < 1e-9:
+            return None   # no action variation in the window -> can't tell
+        # per slot: correlate the slot's POSITION DELTA (frame-to-frame change)
+        # with the action. Delta is cleaner than the stored vy (which is an
+        # EMA that decays during STAY frames and lags). The controlled slot's
+        # delta tracks the action; passive slots' deltas don't. We take the
+        # max over both cx and vy correlation to stay general ('the position
+        # component that tracks the action').
+        best_slot, best_corr = None, 0.0
+        for slot in range(self.MAX_OBJECTS):
+            j = slot * self.STATE_PER_OBJ
+            dxs = np.array([hist[i + 1][j] - hist[i][j] for i in range(n - 1)])
+            dys = np.array([hist[i + 1][j + 1] - hist[i][j + 1]
+                            for i in range(n - 1)])
+            for d in (dxs, dys):
+                d = d - d.mean()
+                vd = float(np.sqrt((d ** 2).sum()))
+                if vd < 1e-9:
+                    continue
+                corr = abs(float((d * act_signed).sum() / (vd * denom)))
+                if corr > best_corr:
+                    best_corr, best_slot = corr, slot
+        if best_slot is None or best_corr < self.CONTROLLED_CORR_GATE:
+            return None   # nothing's motion tracks the action enough
+        self._controlled_slot = best_slot
+        for tid, sl in self._slot_map.items():
+            if sl == best_slot and any(t["id"] == tid for t in tracks):
+                return tid
+        return None
 
     # ---- the dynamic-rollout stop rule (no Pong geometry) ----
     def _is_unrealistic(self, state, corr_norm):

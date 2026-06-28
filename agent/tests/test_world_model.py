@@ -474,3 +474,54 @@ def test_model_assisted_coast_gap_velocity_not_frozen():
         f"{agree_hint}/{n_hint}) is NOT better than the frozen baseline "
         f"({rate0:.2f}, {agree0}/{n0}); the loop is not making the gap "
         f"velocity more bounce-aware than freezing.")
+
+
+# ---------------- OPTION C: world model IS the labeler -----------------------
+
+def test_world_model_discovers_controlled_object():
+    """OPTION C: the world model discovers the controlled object from its OWN
+    history -- the slot whose POSITION DELTA correlates most with the action
+    over time is the object my action moves. No separate class-model labeler;
+    the dynamics data the world model already aggregates answers the labeling
+    question. This is the on-plan 'dissolve the perception/labeling chicken-
+    and-egg' move: one learned surface (the dynamics model) answers both
+    'what will happen next' and 'what is each object'.
+
+    After training, wm.controlled_track(tracks) returns the MY-PADDLE's track
+    id (the object at the left, cx ~ 0.12, the one the action moves) -- NOT a
+    passive object (the ball, the opponent). Stated in discovered terms: the
+    slot whose motion tracks the action, not 'the left paddle'."""
+    scene = PointScene(seed=1)
+    wm = WorldModel(H, W, num_actions=3, n_features=1000, gamma=0.5)
+    perc = Perception(H, W)   # legacy, used ONLY for GT (the my-paddle track id)
+    rng = np.random.default_rng(777)
+    hold, cur = 4, ACT_STAY
+    gt_my = None
+    discovered = None
+    for f in range(1200):
+        if f % hold == 0:
+            cur = int(rng.choice([ACT_UP, ACT_DOWN, ACT_STAY]))
+        r = scene.step(_SCALAR[cur])
+        gray = scene.render(1.0)
+        tracks, gt = perc.step(gray, cur)
+        if gt_my is None and gt is not None:
+            gt_my = gt
+        if f >= 800:   # well past warmup; check it's stable
+            d = wm.controlled_track(tracks)
+            if d is not None:
+                discovered = d
+        wm.step(tracks, cur, r, gt)
+    assert gt_my is not None, "no GT controlled object (legacy perception failed)"
+    assert discovered is not None, (
+        "world model never discovered a controlled object after 1200 frames -- "
+        "the action-velocity correlation query is not finding the paddle")
+    assert discovered == gt_my, (
+        f"world model discovered track {discovered} as controlled, but the "
+        f"my-paddle is track {gt_my}; the correlation query picked the wrong "
+        f"object (a passive one)")
+    # and it must NOT be a passive object: the discovered track is at the LEFT
+    # (cx ~ 0.12, the my-paddle), not mid-field (the ball) or right (opp).
+    d_track = next((t for t in tracks if t["id"] == discovered), None)
+    assert d_track is not None and d_track["cx"] / W < 0.25, (
+        f"discovered controlled track is at cx={d_track['cx']/W:.3f}, not the "
+        f"left (my-paddle) region -- the query picked a passive object")
