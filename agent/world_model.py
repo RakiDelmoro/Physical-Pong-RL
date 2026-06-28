@@ -260,10 +260,10 @@ class WorldModel:
         self._next_slot += 1
         return i
 
-    def _nearest_free_slot(self, pos, claimed):
+    def _nearest_free_slot(self, pos, claimed, exclude=None):
         best_slot, best_d = None, self.PERSIST_GATE
         for slot, (lpos, lvel) in self._slot_last.items():
-            if slot in claimed:
+            if slot in claimed or (exclude is not None and slot in exclude):
                 continue
             dead = self._frame - self._slot_frame.get(slot, self._frame)
             pred = lpos + lvel * dead
@@ -289,9 +289,14 @@ class WorldModel:
         return float(np.median(ss))
 
     def _merge_by_kind(self, speed, claimed, exclude=None):
+        # DECOUPLED from controlled: `exclude` is the set of LIVE slots (still
+        # occupied by a current track), not the controlled slot. A new track
+        # merges only into a DEAD same-speed slot (its occupant churned/gone),
+        # so the ball never folds into the paddle's live slot even when their
+        # speeds overlap. Controlled-independent.
         best_slot, best_d = None, self.KIND_THRESH
         for slot in self._slot_speeds:
-            if slot in claimed or slot == exclude:
+            if slot in claimed or (exclude is not None and slot in exclude):
                 continue
             ks = self._slot_kind_speed(slot)
             if ks is None:
@@ -301,15 +306,25 @@ class WorldModel:
                 best_d, best_slot = d, slot
         return best_slot
 
-    def _consolidate_slots(self):
-        if self._controlled_slot is None:
-            return
+    def _consolidate_slots(self, live_slots):
+        # DECOUPLED from controlled. Consolidation merges duplicate same-kind
+        # (same-speed) slots -- the cleanup when _merge_by_kind fails to fold a
+        # new ball track into the existing ball slot in one step. It no longer
+        # reads _controlled_slot; a frame warmup guards the cold start, and a
+        # LIVE-SLOTS guard (controlled-independent) prevents merging two
+        # DIFFERENT live objects (e.g. the two paddles, both ~stationary ->
+        # same speed 0 -> would wrongly merge). Only merge when at least one
+        # slot is DEAD (no current track) -- a dead slot's occupant is gone, so
+        # folding it into a same-speed slot is the 'same object re-detected'
+        # case consolidation exists for.
+        if self._frame < 30:
+            return   # cold-start warmup (frame-based, not controlled-based)
         slots = sorted(self._slot_speeds.keys())
         for i in range(len(slots)):
             for j in range(i + 1, len(slots)):
                 a, b = slots[i], slots[j]
-                if a == self._controlled_slot or b == self._controlled_slot:
-                    continue
+                if a in live_slots and b in live_slots:
+                    continue   # both live -> different objects, do not merge
                 ka, kb = self._slot_kind_speed(a), self._slot_kind_speed(b)
                 if ka is None or kb is None:
                     continue
@@ -325,10 +340,24 @@ class WorldModel:
                     return
 
     def state_from_tracks(self, tracks, controlled_id=None):
-        """Joint state vector from perception's tracks (unchanged slot
-        assignment -- keeps the ball in one stable slot across resets)."""
+        """Joint state vector from perception's tracks (DECOUPLED slot
+        assignment -- keeps the ball in one stable slot across resets without
+        reading the controlled property)."""
         s = np.zeros(self.state_dim, dtype=np.float64)
         claimed = {}
+        current_tids = {t["id"] for t in tracks}
+        # LIVE slots: slots whose previous occupant (track id) is STILL in the
+        # current tracks. A new track must NOT merge into a live slot (that
+        # would fold two different objects into one slot -- e.g. the ball into
+        # the paddle's slot, which happens because a moving paddle's speed
+        # overlaps the ball's). A new track merges only into a DEAD slot (its
+        # occupant churned/gone -- the canonical case is the ball resetting:
+        # old ball tid gone -> old ball slot dead -> new ball merges back in).
+        # This is CONTROLLED-INDEPENDENT: it distinguishes 'dead ball slot' from
+        # 'live paddle slot' by track-id liveness, not by which object is
+        # controlled -- breaking the circular dependency.
+        live_slots = {slot for tid, slot in self._slot_map.items()
+                      if tid in current_tids}
         for t in tracks:
             pos = np.array([t["cx"] / self.frame_w, t["cy"] / self.frame_h])
             vel = np.array([np.clip(t["vx"] / self.frame_w, -1.0, 1.0),
@@ -340,19 +369,22 @@ class WorldModel:
                 slot = None
                 if speed > 0.003:
                     slot = self._merge_by_kind(speed, claimed,
-                                               exclude=self._controlled_slot)
+                                               exclude=live_slots)
                 if slot is None:
-                    slot = self._nearest_free_slot(pos, claimed)
+                    slot = self._nearest_free_slot(pos, claimed,
+                                                   exclude=live_slots)
                 if slot is None:
                     if self._next_slot >= self.MAX_OBJECTS:
                         continue
                     slot = self._new_slot()
                 self._slot_map[tid] = slot
             claimed[slot] = (pos, vel)
-        if controlled_id is not None:
-            cslot = self._slot_map.get(controlled_id)
-            if cslot is not None:
-                self._controlled_slot = cslot
+        # NOTE: under option C, _controlled_slot is set ONLY by controlled_track
+        # (the dynamics query). state_from_tracks no longer writes it from
+        # controlled_id -- that was the circular write (controlled_track reads
+        # the slots to discover controlled, then state_from_tracks rewrote
+        # _controlled_slot from the controlled_id controlled_track returned).
+        # controlled_id is still accepted (signature compat) but ignored here.
         for slot, (pos, vel) in claimed.items():
             j = slot * self.STATE_PER_OBJ
             s[j + 0], s[j + 1] = pos[0], pos[1]
@@ -363,7 +395,7 @@ class WorldModel:
             self._slot_speeds.setdefault(slot, []).append(speed)
             if len(self._slot_speeds[slot]) > 20:
                 self._slot_speeds[slot].pop(0)
-        self._consolidate_slots()
+        self._consolidate_slots(live_slots)
         return s
 
     # ---- the physics default (scaffold, exact, adaptive parameters) ----
@@ -646,8 +678,11 @@ class WorldModel:
     # The Alberta Plan's own move: dissolve the perception/labeling chicken-
     # and-egg -- one learned surface (the dynamics model) answers both
     # "what will happen next" and "what is each object".
-    CONTROLLED_WARMUP = 200   # frames before the controlled-object query is
-                              # trusted (need enough history for a correlation)
+    CONTROLLED_WARMUP = 300   # frames before the controlled-object query is
+                              # trusted (the my-paddle's DIRECT action
+                              # correlation emerges clearly by ~f=300; earlier
+                              # the opp's INDIRECT correlation can spuriously
+                              # win and a wrong commit gets held by hysteresis)
     CONTROLLED_CORR_GATE = 0.05  # min |corr| to NEWLY call a slot controlled
     CONTROLLED_HOLD_GATE = 0.02  # below this, an existing controlled slot is
                                  # dropped (hysteresis: commit high, hold low)

@@ -411,19 +411,6 @@ def _run_with_hint(total=1200, seed=1, act_seed=777, n_features=1000,
     return log, wm
 
 
-@pytest.mark.xfail(
-    reason=(
-        "OPTION-C regression (marginal, known): the A/B comparison (hint vs "
-        "frozen baseline) is now a near-TIE (0.646 vs 0.649) because under "
-        "option C both runs share the same controlled-discovery/slot-assignment "
-        "feedback instability (~82% controlled accuracy), whose noise washes out "
-        "the hint's small benefit. The hint still makes the gap velocity more "
-        "bounce-aware in principle, but the slot noise dominates the measurement "
-        "here. The fix is the same as H1's: break the controlled/slot "
-        "circularity. NOT a model-assisted-coast regression; the loop is wired "
-        "and working."),
-    strict=True,
-)
 def test_model_assisted_coast_gap_velocity_not_frozen():
     """MODEL-ASSISTED COAST (close the perception<->model loop). When the ball
     touches a paddle, its track coasts (the blobs merged). BEFORE the loop was
