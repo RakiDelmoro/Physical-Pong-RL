@@ -550,6 +550,60 @@ class WorldModel:
         corr_norm = float(np.linalg.norm(pred_corr))
         return next_state, pred_r, next_hx, corr_norm
 
+    # ---- model-assisted coast (close the perception<->model loop) ----
+    def velocity_hint(self, track):
+        """A bounce-aware velocity guess for a COASTING track (one whose blob
+        merged with another at a contact/collision, so perception can't see
+        it this frame). `track` is a perception track dict (pixel coords + id).
+        Returns (vx, vy) in PIXEL units, or None if the model is cold / the
+        slot is not found / the guess is not believable.
+
+        This closes the perception<->model loop (a listed ALBERTA_PLAN
+        departure: 'perception -> model is one-directional so far; the
+        feedback loop is a later step'). Instead of `coast()` FREEEZING the
+        pre-bounce velocity through the contact (wrong sign -- the ball
+        already bounced), we ask the world model 'where will this object be
+        next, and how fast?' -- its prediction = physics_default + LEARNED
+        correction, and the correction is where the bounce lives. So the gap
+        velocity becomes bounce-aware instead of frozen-wrong.
+
+        HONEST CIRCULARITY (the caveat): the world model was trained on the
+        corrupted (frozen-wrong) velocity, so its bounce correction is only
+        ~40% of a full flip (measured). So this moves the gap velocity from
+        'fully wrong' to 'less wrong', not to 'right' -- and it feeds the
+        less-wrong velocity back in as input, which may bootstrap stronger
+        over time (a virtuous cycle) or stall. We measure (W3b).
+
+        Believability gate: if the predicted velocity magnitude is implausible
+        (> 3x the track's last known speed, or > 0.3 normalized), return None
+        and fall back to freeze -- a wild guess is worse than a frozen one.
+        """
+        if self._last_state is None or self.n_obs < 200:
+            return None   # cold model -- freeze is safer than a random guess
+        tid = track.get("id")
+        slot = self._slot_map.get(tid)
+        if slot is None:
+            return None   # this track has no world-model slot yet
+        # predict one step from the world model's last state under the last
+        # action; read the predicted velocity for this slot.
+        action = (self._last_action if self._last_action is not None else 0)
+        try:
+            nxt, _r = self._predict(self._last_state, action)
+        except Exception:
+            return None
+        j = slot * self.STATE_PER_OBJ
+        pvx = float(nxt[j + 2]) * self.frame_w   # normalized -> pixel units
+        pvy = float(nxt[j + 3]) * self.frame_h
+        # believability gate: reject implausible guesses (fall back to freeze)
+        cur_spd = float(np.hypot(track.get("vx", 0.0), track.get("vy", 0.0)))
+        pspdl = float(np.hypot(pvx, pvy))
+        # 0.3 normalized ~= a large fraction of the frame in one step
+        if pspdl > 0.3 * max(self.frame_w, self.frame_h):
+            return None
+        if cur_spd > 1e-3 and pspdl > 3.0 * cur_spd:
+            return None
+        return pvx, pvy
+
     def predict_reward(self, tracks, action, controlled_id=None):
         """Predict the reward_delta following this (state, action). The
         foresight signal."""

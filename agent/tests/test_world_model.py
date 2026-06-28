@@ -108,8 +108,8 @@ class PointScene:
 
 def _run(total=2000, seed=1, act_seed=777, n_features=1000, gamma=0.5):
     scene = PointScene(seed=seed)
-    perc = Perception(H, W)
     wm = WorldModel(H, W, num_actions=3, n_features=n_features, gamma=gamma)
+    perc = Perception(H, W, velocity_hint_fn=wm.velocity_hint)
     rng = np.random.default_rng(act_seed)
     hold = 4
     cur = ACT_STAY
@@ -175,8 +175,8 @@ def _run_with_log(total=1200, n_features=1000, gamma=0.5,
     velocity (so a rollout can be checked against reality). Used by the
     rollout/bounce test."""
     scene = PointScene(seed=seed)
-    perc = Perception(H, W)
     wm = WorldModel(H, W, num_actions=3, n_features=n_features, gamma=gamma)
+    perc = Perception(H, W, velocity_hint_fn=wm.velocity_hint)
     rng = np.random.default_rng(act_seed)
     hold = 4
     cur = ACT_STAY
@@ -366,3 +366,111 @@ if __name__ == "__main__":
                   and np.sign(preds[idx - 1]) == np.sign(rewards[idx]))
     total = sum(1 for idx in nonzero if idx - 1 >= 200)
     print(f"foresight: {correct}/{total} = {correct / total:.2f}")
+
+
+# ------------------------------ MODEL-ASSISTED COAST -------------------------
+
+def _run_with_hint(total=1200, seed=1, act_seed=777, n_features=1000,
+                   gamma=0.5):
+    """Run the loop WITH the perception<->model loop closed: perception's
+    coasting tracks ask the world model for a bounce-aware velocity instead of
+    freezing. Returns (log, wm) where each log entry has the GT ball velocity
+    and the ball-track's reported velocity + whether it was coasting (missed>0)
+    + whether a model hint was used this frame for the ball track."""
+    scene = PointScene(seed=seed)
+    wm = WorldModel(H, W, num_actions=3, n_features=n_features, gamma=gamma)
+    # the wiring: perception's velocity_hint_fn -> world model's velocity_hint.
+    # Closes the loop. Perception stays decoupled (no world-model import).
+    perc = Perception(H, W, velocity_hint_fn=wm.velocity_hint)
+    rng = np.random.default_rng(act_seed)
+    hold, cur = 4, ACT_STAY
+    log = []
+    for f in range(total):
+        if f % hold == 0:
+            cur = int(rng.choice([ACT_UP, ACT_DOWN, ACT_STAY]))
+        r = scene.step(_SCALAR[cur])
+        gray = scene.render(1.0)
+        tracks, controlled = perc.step(gray, cur)
+        bx = scene.bx + scene.bs / 2
+        by = scene.by + scene.bs / 2
+        best, bd = None, 1e9
+        for t in tracks:
+            d = ((t["cx"] - bx) ** 2 + (t["cy"] - by) ** 2) ** 0.5
+            if d < bd:
+                bd, best = d, t
+        rvx = best["vx"] if best is not None and bd < 25 else None
+        log.append({"f": f, "gt_bvx": scene.bvx, "rvx": rvx,
+                    "missed": (best["missed"] if best else None),
+                    "gt_bx": scene.bx})
+        wm.step(tracks, cur, r, controlled)
+    return log, wm
+
+
+def test_model_assisted_coast_gap_velocity_not_frozen():
+    """MODEL-ASSISTED COAST (close the perception<->model loop). When the ball
+    touches a paddle, its track coasts (the blobs merged). BEFORE the loop was
+    closed, the gap velocity was FROZEN at the pre-bounce value -> wrong sign
+    (the ball already bounced). WITH the loop closed, perception asks the
+    world model for a bounce-aware velocity during the coast, so the gap
+    velocity should be CLOSER to the real (post-bounce) velocity than the
+    frozen pre-bounce value would be.
+
+    Test: at contact frames (ball at a paddle, track coasting), the reported
+    ball velocity has the SAME SIGN as the real post-bounce velocity more
+    often than the frozen (pre-bounce, wrong-sign) value would. We compare
+    against a no-hint baseline run directly.
+    """
+    log_hint, wm = _run_with_hint(total=1200)
+    # how often does the coasting ball-track's reported vx share the sign of
+    # the REAL ball velocity, AT contact (ball near a paddle plane)?
+    mx, ox = 16 + 3, (W - 16 - 6) + 3   # paddle center x's in this scene
+    def contact_sign_agreement(log):
+        agree, n = 0, 0
+        for e in log:
+            if e["missed"] is None or e["missed"] == 0 or e["rvx"] is None:
+                continue
+            if abs(e["gt_bx"] + 3 - mx) > 12 and abs(e["gt_bx"] + 3 - ox) > 12:
+                continue   # not at a paddle
+            n += 1
+            if np.sign(e["rvx"]) == np.sign(e["gt_bvx"]):
+                agree += 1
+        return agree, n
+    agree_hint, n_hint = contact_sign_agreement(log_hint)
+    # baseline: same run WITHOUT the hint (pure freeze)
+    scene = PointScene(seed=1)
+    wm0 = WorldModel(H, W, num_actions=3, n_features=1000, gamma=0.5)
+    perc0 = Perception(H, W)   # no velocity_hint_fn -> legacy freeze
+    rng = np.random.default_rng(777)
+    hold, cur = 4, ACT_STAY
+    log0 = []
+    for f in range(1200):
+        if f % hold == 0:
+            cur = int(rng.choice([ACT_UP, ACT_DOWN, ACT_STAY]))
+        scene.step(_SCALAR[cur])
+        gray = scene.render(1.0)
+        tracks, controlled = perc0.step(gray, cur)
+        bx = scene.bx + scene.bs / 2
+        best, bd = None, 1e9
+        for t in tracks:
+            d = ((t["cx"] - bx) ** 2 + (t["cy"] - bx) ** 2) ** 0.5
+            if d < bd:
+                bd, best = d, t
+        rvx = best["vx"] if best is not None and bd < 25 else None
+        log0.append({"f": f, "gt_bvx": scene.bvx, "rvx": rvx,
+                     "missed": (best["missed"] if best else None),
+                     "gt_bx": scene.bx})
+        wm0.step(tracks, cur, 0, controlled)
+    agree0, n0 = contact_sign_agreement(log0)
+    # the hint should make the gap velocity agree with the real post-bounce
+    # sign MORE often than the frozen (wrong-sign) baseline. We need enough
+    # contact-coast frames to measure.
+    assert n_hint >= 10 and n0 >= 10, (
+        f"only {n_hint}/{n0} contact-coast frames; need >=10 to measure the "
+        "gap-velocity sign (tune the scene if this regresses)")
+    rate_hint = agree_hint / n_hint
+    rate0 = agree0 / n0
+    assert rate_hint > rate0, (
+        f"model-assisted coast gap-velocity sign agreement ({rate_hint:.2f}, "
+        f"{agree_hint}/{n_hint}) is NOT better than the frozen baseline "
+        f"({rate0:.2f}, {agree0}/{n0}); the loop is not making the gap "
+        f"velocity more bounce-aware than freezing.")

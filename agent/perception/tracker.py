@@ -286,7 +286,17 @@ class Track:
             if len(self.act_hist) > self.ACT_LEN:
                 self.act_hist.pop(0)
 
-    def coast(self):
+    def coast(self, velocity_hint=None):
+        # MODEL-ASSISTED COAST (close the perception<->model loop). When a
+        # track is occluded (its blob merged with another at a contact /
+        # collision -- the canonical case is the ball touching a paddle), the
+        # old behavior FREEZES the pre-bounce velocity -> the gap velocity has
+        # the WRONG SIGN (the ball already bounced). If a `velocity_hint`
+        # (vx, vy) is provided by the world model (a bounce-aware prediction),
+        # use it instead -- so the gap velocity is plausible, not frozen-wrong.
+        # If no hint (cold model / not believable), freeze as before.
+        if velocity_hint is not None:
+            self.vx, self.vy = float(velocity_hint[0]), float(velocity_hint[1])
         self.cx += self.vx
         self.cy += self.vy
         self.missed += 1
@@ -322,7 +332,7 @@ class ObjectTracker:
         self._tracks = []
         self._next_id = 1
 
-    def update(self, candidates, frame, action=None):
+    def update(self, candidates, frame, action=None, velocity_hint_fn=None):
         if self.utility is not None and action is not None:
             self.utility.note_action(action)
         preds = [t._predicted() for t in self._tracks]
@@ -363,7 +373,10 @@ class ObjectTracker:
 
         for ti, t in enumerate(self._tracks):
             if ti not in matched_t:
-                t.coast()
+                hint = None
+                if velocity_hint_fn is not None:
+                    hint = velocity_hint_fn(t.as_dict())
+                t.coast(velocity_hint=hint)
         for ci, c in enumerate(candidates):
             if ci not in matched_c:
                 self._tracks.append(Track(self._next_id, c, frame))

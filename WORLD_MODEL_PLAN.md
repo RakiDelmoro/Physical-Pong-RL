@@ -297,17 +297,44 @@ Measured result:
 ### What remains for W3b (the freeze)
 
 The remaining blocker is the FREEZE: the gap velocity has the wrong sign
-because `coast()` has no bounce-aware guess. The on-plan fix is to CLOSE THE
-PERCEPTION<->MODEL LOOP (a listed departure): when a track coasts at a
-contact, ask the world model for its predicted next position (bounce-aware)
-instead of freezing. HONEST CIRCULARITY: the world model was trained on the
-corrupted velocity, and its bounce correction is only ~40% of a full flip
-(per the second-pass measurements), so model-assisted coast can only move the
-gap velocity from "fully wrong" to "less wrong," not to "right" -- and it
-feeds the frozen wrong velocity back in as input. So model-assisted coast is
-a partial improvement, not a clean fix; the deeper unblocker is a
-position-derived velocity estimator that does not regress W2 (the thing the
-LSQ attempt failed at). This is the open next step.
+because `coast()` had no bounce-aware guess. The on-plan fix -- CLOSE THE
+PERCEPTION<->MODEL LOOP -- is now BUILT  [DONE; seeded, not converged]:
+
+  - `WorldModel.velocity_hint(track)` predicts one bounce-aware step for a
+    coasting track's slot (physics_default + LEARNED correction; the
+    correction is where the bounce lives).
+  - `Track.coast(velocity_hint=...)` uses the hint instead of freezing; a
+    believability gate falls back to freeze if the guess is implausible.
+  - `Perception(velocity_hint_fn=...)` wires it via a callback -- perception
+    stays DECOUPLED from the world model (no import; the agent loop wires it).
+    This closes a listed ALBERTA_PLAN departure ('perception -> model is
+    one-directional so far; the feedback loop is a later step').
+
+Measured result (the honest circularity playing out):
+  - The gap velocity IS more bounce-aware than freezing: a direct A/B test
+    (`test_model_assisted_coast_gap_velocity_not_frozen`) shows the
+    coasting ball-track's reported vx agrees with the real post-bounce sign
+    MORE often with the hint than without. The loop works. NEW GREEN TEST.
+  - W2 did NOT regress: foresight 0.857 (was ~0.86). The guard held.
+  - W3b is STILL xfail. Direct diagnosis of the rollout: at a clean approach
+    frame (ball heading right, vx=+0.015, opp plane at 0.86), the imagined
+    ball moves LEFT (cx 0.376 -> 0.170) -- the world model's LEARNED
+    CORRECTION is still corrupted, pushing the ball the wrong way. The hint
+    improves the INPUT velocity going forward, but the model's WEIGHTS were
+    shaped by ~1000 frames of the OLD corrupted (freeze-then-spike) data, and
+    1200 frames of slightly-better data is not enough to relearn clean
+    dynamics. The VIRTUOUS CYCLE (less-wrong input -> stronger correction ->
+    less-wrong input) is SEEDED but NOT CONVERGED.
+
+HONEST TAKE: the loop is wired, working, on-plan, and non-regressing -- real
+progress -- but it did not flip W3b green, exactly the risk flagged before
+building it. The deeper unblocker is the one the LSQ attempt failed at: a
+position-derived velocity estimator that does not regress W2 (so the training
+data is clean from the start, not bootstrapped out of corruption). That, or
+simply MORE FRAMES for the virtuous cycle to converge (the rig streams
+forever). W3b stays xfail honestly; the loop stays (it is a genuine
+improvement and on-plan) and will be re-measured once the rig streams longer
+or a clean estimator lands.
 
 ## What's unblocked next: the Horde (Step 3)  [DONE]
 

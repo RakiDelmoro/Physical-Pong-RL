@@ -36,7 +36,7 @@ class Perception:
     def __init__(self, frame_h, frame_w, delay=3, num_actions=3,
                  n_freq=2, cheb_degree=3, forgetting=0.999, z_thresh=None,
                  use_utility=True, utility_retire=0.0, utility_warmup=5,
-                 top_k=6, permissive_z=1.5):
+                 top_k=6, permissive_z=1.5, velocity_hint_fn=None):
         self.frame_h = int(frame_h)
         self.frame_w = int(frame_w)
         # Seed mode (Move 1): the DEFAULT seed is top-K (keep the K most salient
@@ -50,6 +50,12 @@ class Perception:
         self._top_k = top_k
         self._permissive_z = permissive_z
         self._z_thresh = z_thresh
+        # MODEL-ASSISTED COAST: an optional callback the tracker calls when a
+        # track coasts (occluded at a contact). velocity_hint_fn(track_dict)
+        # -> (vx, vy) in PIXEL units, or None (fall back to freeze). Wired by
+        # the agent loop to the world model -- keeps perception decoupled from
+        # the world model module (no import). None = the legacy freeze.
+        self._velocity_hint_fn = velocity_hint_fn
         self.utility = (BehaviorUtility(retire_below=utility_retire,
                                         warmup=utility_warmup)
                         if use_utility else None)
@@ -94,7 +100,9 @@ class Perception:
             # the bare propose_regions default, so the no-fallback invariant
             # holds everywhere.
             cands = propose_regions(gray, top_k=6, permissive_z=self._permissive_z)
-        tracks = self.tracker.update(cands, self._step, action=self._last_action)
+        tracks = self.tracker.update(cands, self._step,
+                                     action=self._last_action,
+                                     velocity_hint_fn=self._velocity_hint_fn)
 
         live = set()
         for t in tracks:
