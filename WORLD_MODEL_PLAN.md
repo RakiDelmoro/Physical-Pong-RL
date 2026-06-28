@@ -249,24 +249,65 @@ documented known-gap. The precise remaining blocker, measured directly:
     "ball vanishes into the paddle blob" diagnosis was WRONG -- re-traced
     frame by frame, the ball is not lost at bounces. The churn is at RESETS
     (a real new ball), not overlaps.
-  - But the ball's VELOCITY estimate is wrong through the bounce: it FREEZES
-    at the old direction during the coast, then SPIKES to an unphysical
-    value (-0.085 vs real -0.014) at re-acquisition. So the residual the
-    world model trains on does NOT contain a clean "velocity reversed" event
-    at the bounce -- the signal is entangled with the coast/spike artifact.
-  - An LSQ velocity fix was tried (responsive, glitch-robust) but REGRESSED
-    W2 (foresight 0.86 -> 0.64) -- the changed velocity ripples through the
-    whole pipeline. Reverted.
+  - But the ball's VELOCITY estimate is wrong through the bounce. TWO
+    artifacts, now separated by a direct probe (see "Contact probe" below):
+      (1) FREEZE: while the ball's track coasts (the ball blob merged with
+          the paddle blob at contact), `coast()` freezes vx at the PRE-bounce
+          value -- so the gap velocity has the WRONG SIGN (the ball already
+          bounced, but the report still says it is going the old way).
+      (2) SPIKE: on re-acquisition, `update()` computed velocity from the
+          GAP-SPANNING displacement (cx had drifted by the frozen vel for N
+          frames), producing an unphysical value (~-13px/frame when real
+          motion is ~-2px/frame). [FIXED -- see "No-snap re-acquisition"
+          below.]
+  - The FREEZE remains: an LSQ velocity fix was tried but REGRESSED W2
+    (foresight 0.86 -> 0.64). Reverted. So the bounce signal in the training
+    data is still smeared (wrong-sign gap velocity), which is why W3b is
+    still xfail even after the spike fix.
 
-So W3's remaining blocker is a PERCEPTION problem: a responsive, non-spiking
-velocity estimate for fast objects during occlusion/coast. It is NOT a
-world-model-architecture problem (DPC, event-skip, and the slot fix are all
-done and correct). The world model cannot learn a bounce that isn't a clean
-signal in its training data, and the velocity artifact hides the bounce.
+### Contact probe (what the data actually shows)
 
-Next attempts at W3 should target the occlusion-velocity quality in
-perception (a responsive estimator that doesn't regress W2), NOT more
-world-model architecture. This is parked until that lands.
+A direct probe of a real run tagged every ball-id churn as CONTACT (ball at
+a paddle), RESET (a point), or NEITHER. Result: the MAJORITY of churns are
+CONTACT at a paddle (not generic occlusion, not just resets). The bounce is
+the canonical case. The freeze-then-spike is caused by `coast()` freezing
+the pre-bounce velocity through the contact, then `update()` snapping to the
+gap displacement on re-acquisition. The fix target is confirmed: carry the
+ball's identity/velocity cleanly through paddle contact.
+
+### No-snap re-acquisition  [DONE; spike fixed, freeze remains]
+
+The contained, decoupled fix for the SPIKE: on re-acquisition after a coast,
+`Track.update` now accepts the fresh POSITION (reliable) but KEEPS the
+pre-coast velocity this frame instead of snapping to the gap-spanning
+displacement; the normal EMA resumes on the next fresh frame and corrects
+the velocity over 2-3 frames. This touches only the ~3 frames around a
+re-acquisition, not the general velocity character.
+
+Measured result:
+  - The unphysical spike is GONE: max reported ball velocity at contact
+    dropped from ~-13px/frame to ~-3.4px/frame (real motion is ~-2.2). New
+    perception test `test_no_velocity_spike_at_paddle_contact` (green).
+  - W2 did NOT regress: foresight 0.857 (was ~0.86). The guard held -- the
+    fix is strictly more physical and only touches re-acquisition frames.
+  - W3b is STILL xfail: the FREEZE (wrong-sign gap velocity) remains, so the
+    bounce signal is still smeared in the training data. Killing the spike
+    was necessary but not sufficient.
+
+### What remains for W3b (the freeze)
+
+The remaining blocker is the FREEZE: the gap velocity has the wrong sign
+because `coast()` has no bounce-aware guess. The on-plan fix is to CLOSE THE
+PERCEPTION<->MODEL LOOP (a listed departure): when a track coasts at a
+contact, ask the world model for its predicted next position (bounce-aware)
+instead of freezing. HONEST CIRCULARITY: the world model was trained on the
+corrupted velocity, and its bounce correction is only ~40% of a full flip
+(per the second-pass measurements), so model-assisted coast can only move the
+gap velocity from "fully wrong" to "less wrong," not to "right" -- and it
+feeds the frozen wrong velocity back in as input. So model-assisted coast is
+a partial improvement, not a clean fix; the deeper unblocker is a
+position-derived velocity estimator that does not regress W2 (the thing the
+LSQ attempt failed at). This is the open next step.
 
 ## What's unblocked next: the Horde (Step 3)  [DONE]
 

@@ -234,13 +234,37 @@ class Track:
         self.last_pred_err = float(((cand["cx"] - px) ** 2 +
                                     (cand["cy"] - py) ** 2) ** 0.5)
         ncx, ncy = cand["cx"], cand["cy"]
-        # position: responsive (so the per-frame displacement the model learns
-        # from actually reflects the action; a heavy position EMA smears the
-        # action signal across frames and the model can't learn causality).
-        self.vx = pos_ema * (ncx - self.cx) + (1 - pos_ema) * self.vx
-        self.vy = pos_ema * (ncy - self.cy) + (1 - pos_ema) * self.vy
-        self.cx = pos_ema * ncx + (1 - pos_ema) * self.cx
-        self.cy = pos_ema * ncy + (1 - pos_ema) * self.cy
+        # NO-SNAP RE-ACQUISITION (the contact/collision fix). If this track was
+        # COASTING (missed > 0 -- it was occluded, typically because two blobs
+        # merged at a contact/collision), then during the coast cx/cy advanced
+        # by the FROZEN velocity. So (ncx - self.cx) here is the GAP-SPANNING
+        # displacement over several frames, NOT a per-frame velocity. Feeding
+        # that into the velocity EMA produces an unphysical SPIKE (measured:
+        # ~-13px/frame when real motion is ~-2px/frame) -- the artifact that
+        # hides the bounce from the world model. Instead: accept the new
+        # POSITION (the candidate is where the object actually is -- reliable),
+        # but KEEP the pre-coast velocity this frame and let the next few FRESH
+        # frames' EMA correct it smoothly. Kills the spike; the pre-coast
+        # velocity is corrected over 2-3 fresh frames instead of one huge
+        # jump. This is the contained, decoupled fix -- it touches only the
+        # ~3 frames around a re-acquisition, not the general velocity
+        # character, so it does not regress downstream consumers (W2).
+        reacquiring = self.missed > 0
+        if reacquiring:
+            # position: accept the fresh observation (reliable).
+            self.cx = pos_ema * ncx + (1 - pos_ema) * self.cx
+            self.cy = pos_ema * ncy + (1 - pos_ema) * self.cy
+            # velocity: UNCHANGED this frame (no snap to the gap displacement).
+            # The normal EMA below resumes on the next fresh frame.
+        else:
+            # position: responsive (so the per-frame displacement the model
+            # learns from actually reflects the action; a heavy position EMA
+            # smears the action signal across frames and the model can't learn
+            # causality).
+            self.vx = pos_ema * (ncx - self.cx) + (1 - pos_ema) * self.vx
+            self.vy = pos_ema * (ncy - self.cy) + (1 - pos_ema) * self.vy
+            self.cx = pos_ema * ncx + (1 - pos_ema) * self.cx
+            self.cy = pos_ema * ncy + (1 - pos_ema) * self.cy
         # shape: stable (used for cohesion gating + dimensionality cue; jitter
         # here would split/merge tracks spuriously).
         for a in ("w", "h", "area", "aspect", "extent"):

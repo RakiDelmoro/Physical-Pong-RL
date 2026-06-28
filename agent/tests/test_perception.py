@@ -386,3 +386,83 @@ def test_classmodel_revival_requires_proximity():
     assert cm.objects[2].n_obs == 0, (
         "a far-away new track inherited a dead learner's probation; the "
         "proximity gate is not gating revival")
+
+
+# ------------------------------ CLAIM: no velocity spike at contact ----------
+
+def test_no_velocity_spike_at_paddle_contact():
+    """The contact/collision fix. When the ball touches a paddle, the ball
+    blob merges with the paddle blob -> the ball track coasts (occluded) for a
+    few frames -> it re-acquires on separation. BEFORE the fix, re-acquisition
+    computed velocity from the GAP-SPANNING displacement, producing an
+    unphysical SPIKE (~-13px/frame when real motion is ~-2px/frame) that hid
+    the bounce from the world model. AFTER the no-snap fix, the re-acquiring
+    track keeps its pre-coast velocity and lets fresh frames correct it, so
+    the reported velocity stays bounded (no spike).
+
+    Uses the world-model test's PointScene (paddles block in their real
+    y-range -> real bounces -> real contact/occlusion). We log the ball's
+    reported velocity every frame (the track nearest GT ball) and assert it
+    never exceeds a physical bound, and specifically does not spike at the
+    re-acquisition frames right after a paddle contact.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "twm", "/workspace/agent/tests/test_world_model.py")
+    twm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(twm)
+    PointScene, H_, W_ = twm.PointScene, twm.H, twm.W
+    ACT_UP_, ACT_DOWN_, ACT_STAY_ = twm.ACT_UP, twm.ACT_DOWN, twm.ACT_STAY
+    SC = {ACT_UP_: +1, ACT_DOWN_: -1, ACT_STAY_: 0}
+
+    scene = PointScene(seed=1)
+    perc = Perception(H_, W_)
+    rng = np.random.default_rng(777)
+    hold, cur = 4, ACT_STAY_
+    FREE_FLIGHT = 2.2          # the ball's |bvx| in this scene
+    SPIKE_BOUND = 3.0 * FREE_FLIGHT   # 3x free-flight = clearly non-spike
+    v_log = []
+    contact_v = []
+    for f in range(1200):
+        if f % hold == 0:
+            cur = int(rng.choice([ACT_UP_, ACT_DOWN_, ACT_STAY_]))
+        scene.step(SC[cur])
+        gray = scene.render(1.0)
+        tracks, _ = perc.step(gray, cur)
+        bx = scene.bx + scene.bs / 2
+        by = scene.by + scene.bs / 2
+        # nearest track to GT ball
+        best, bd = None, 1e9
+        for t in tracks:
+            d = ((t["cx"] - bx) ** 2 + (t["cy"] - by) ** 2) ** 0.5
+            if d < bd:
+                bd, best = d, t
+        rvx = (best["vx"] if best is not None and bd < 25 else None)
+        v_log.append((f, rvx, bd, best.get("missed") if best else None))
+        # collect velocities at CONTACT frames (ball near a paddle plane) --
+        # this is where the spike used to happen on re-acquisition.
+        mx, ox = scene.my_x + scene.pw / 2, scene.opp_x + scene.pw / 2
+        if (abs(bx - mx) < 10 or abs(bx - ox) < 10) and rvx is not None:
+            contact_v.append((f, rvx, best.get("missed")))
+
+    # 1) GLOBAL: no reported ball velocity ever exceeds the spike bound.
+    finite = [v for _, v, _, _ in v_log if v is not None]
+    vmax = max(abs(v) for v in finite)
+    assert vmax < SPIKE_BOUND, (
+        f"reported ball velocity spiked to {vmax:.1f}px/frame "
+        f"(bound {SPIKE_BOUND:.1f}); the no-snap re-acquisition fix is not "
+        f"bounding the gap-spanning displacement spike. "
+        f"Before the fix this hit ~13px/frame.")
+
+    # 2) AT CONTACT: the re-acquisition frames (missed was >0 -> just
+    # re-matched) near a paddle do not spike. This is the specific case.
+    contact_max = max((abs(v) for _, v, _ in contact_v), default=0.0)
+    assert contact_max < SPIKE_BOUND, (
+        f"velocity at paddle contact spiked to {contact_max:.1f}px/frame "
+        f"(bound {SPIKE_BOUND:.1f}); the no-snap fix is not working at the "
+        f"re-acquisition frame where the spike historically occurred.")
+
+    # 3) SANITY: we actually saw contact frames (else the test is vacuous).
+    assert len(contact_v) >= 10, (
+        f"only {len(contact_v)} contact frames observed; need >=10 for the "
+        f"test to be meaningful (tune the scene if this regresses)")
