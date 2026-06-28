@@ -100,3 +100,119 @@ def propose_regions(gray, z_thresh=2.2, min_area=6, radii=(8, 16, 24),
         out.sort(key=lambda r: r["salience"], reverse=True)
         return out[:top_k]
     return out
+
+
+# ====================================================================
+# TOP-DOWN / PREDICTION-CONDITIONED proposal (the contact/identity fix).
+# ====================================================================
+# The legacy `propose_regions` above is BOTTOM-UP: it finds blobs by
+# connected components, so any pixels that TOUCH become ONE blob. That rule
+# destroys identity the moment two objects get close (ball touches paddle ->
+# one merged blob -> the tracker loses the ball). Targeted fixes downstream
+# (no-snap re-acquisition, model-assisted coast) all hit this same wall: the
+# identity is gone before the tracker ever sees a candidate.
+#
+# The fix is TOP-DOWN (predictive coding, pushed into perception): we already
+# KNOW where each existing track expects to be (its predicted position). So
+# before connected components can merge anything, we assign each salient pixel
+# to the NEAREST predicted track within that track's search radius. Each
+# track's claimed pixels become its OWN candidate -- even if those pixels were
+# part of a merged blob. Identity is carried TOP-DOWN (from the predictions),
+# not derived BOTTOM-UP (from touching pixels), so a merge can no longer
+# destroy it. Whatever salient pixels NO track explains -> connected
+# components -> NEW-object candidates (the bottom-up path, demoted to 'new
+# things only'). This is the BLENDED scaffold: top-down for known/occluded
+# objects, bottom-up for surprises. GENERAL: no Pong vocabulary -- the rule is
+# 'each pixel goes to the nearest predicted object within range; the rest is
+# new', true in any world with moving objects.
+
+def propose_regions_conditioned(gray, predictions, z_thresh=2.2, min_area=4,
+                                 radii=(8, 16, 24), close_ksize=7,
+                                 open_ksize=3, permissive_z=1.5):
+    """Prediction-conditioned proposal. Top-down for known objects, bottom-up
+    for new ones.
+
+    `predictions` : list of (px, py, radius) -- each existing track's
+        predicted pixel position and a search radius (how far the object may
+        be from the prediction and still be claimed by that track). May be
+        empty (cold start -> pure bottom-up, same as propose_regions).
+
+    Returns (claimed, residual) where:
+      claimed  : list of candidates, ONE per input prediction (in the same
+                 order), or None for a prediction that found no salient
+                 pixels in its radius (the object was not visible there --
+                 the tracker will coast it). Each candidate is a dict with the
+                 same shape as propose_regions' output, plus 'pred_idx'.
+      residual : list of candidates from salient pixels NO track claimed
+                 (new objects / surprises) -- the bottom-up path, demoted to
+                 'new things only'.
+    """
+    z = saliency_zscore(gray, radii=radii)
+    thresh = permissive_z
+    mask = (z > thresh).astype(np.uint8) * 255
+    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_ksize, close_ksize))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kc)
+    ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_ksize, open_ksize))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ko)
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        claimed = [None] * len(predictions)
+        return claimed, []
+
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)  # (N, 2)
+
+    # ---- assign each salient pixel to the NEAREST predicted track within
+    # that track's search radius (a Voronoi-like assignment conditioned on
+    # the predictions). A pixel claimed by NO track is 'residual' (new). ----
+    owner = np.full(len(pts), -1, dtype=np.int64)   # -1 = residual / new
+    if predictions:
+        best_d = np.full(len(pts), np.inf, dtype=np.float32)
+        for pi, (px, py, rad) in enumerate(predictions):
+            d = np.sqrt((pts[:, 0] - px) ** 2 + (pts[:, 1] - py) ** 2)
+            closer = d < best_d
+            within = d <= rad
+            take = closer & within
+            owner[take] = pi
+            best_d[take] = d[take]
+
+    def _cand_from_pixels(px, py):
+        x0, y0 = int(px.min()), int(py.min())
+        w0 = int(px.max()) - x0 + 1
+        h0 = int(py.max()) - y0 + 1
+        area = float(len(px))
+        aspect = (w0 / float(h0)) if h0 > 0 else 1.0
+        extent = (area / float(w0 * h0)) if (w0 * h0) > 0 else 0.0
+        return {"cx": float(px.mean()), "cy": float(py.mean()),
+                "w": float(w0), "h": float(h0), "area": area,
+                "aspect": aspect, "extent": extent,
+                "salience": float(z[py, px].mean())}
+
+    # ---- per-prediction claimed candidates (one per track, in order) ----
+    claimed = [None] * len(predictions)
+    for pi in range(len(predictions)):
+        sel = owner == pi
+        if sel.sum() < min_area:
+            continue   # nothing (or too little) at this prediction -> coast
+        c = _cand_from_pixels(xs[sel], ys[sel])
+        c["pred_idx"] = pi
+        claimed[pi] = c
+
+    # ---- residual: salient pixels no track claimed -> new objects (bottom-
+    # up connected components, demoted to 'new things only') ----
+    residual = []
+    res_sel = owner == -1
+    if res_sel.any():
+        rx, ry = xs[res_sel], ys[res_sel]
+        # label the residual pixels (they are a subset of the mask; build a
+        # sub-mask and run connected components on it).
+        sub = np.zeros_like(mask)
+        sub[ry, rx] = 255
+        n_lbl, lbl = cv2.connectedComponents(sub, 8)
+        for i in range(1, n_lbl):
+            yy, xx = np.where(lbl == i)
+            if len(xx) < min_area:
+                continue
+            c = _cand_from_pixels(xx, yy)
+            residual.append(c)
+    return claimed, residual

@@ -466,3 +466,95 @@ def test_no_velocity_spike_at_paddle_contact():
     assert len(contact_v) >= 10, (
         f"only {len(contact_v)} contact frames observed; need >=10 for the "
         f"test to be meaningful (tune the scene if this regresses)")
+
+
+# ---------------- PREDICTION-CONDITIONED proposal (top-down / contact) -------
+
+def _two_touching_blobs_frame():
+    """A 160x160 frame with TWO bright objects whose blobs TOUCH (merged into
+    one connected component by the legacy proposal). Object A on the left,
+    object B on the right, touching in the middle. This is the contact/
+    collision case -- the thing that destroys identity in the bottom-up
+    scaffold. Built to be Pong-agnostic: just 'two objects that touch'."""
+    import numpy as np
+    img = np.full((160, 160), 24, dtype=np.float32)
+    # two 12x12 bright squares touching at x=84 (A: x 72..83, B: x 84..95)
+    img[70:82, 72:84] = 220      # A, center ~ (77.5, 76)
+    img[70:82, 84:96] = 220      # B, center ~ (89.5, 76)
+    return np.clip(img, 0, 255).astype(np.uint8), (77.5, 76.0), (89.5, 76.0)
+
+
+def test_conditioned_proposal_keeps_identity_through_contact():
+    """The core top-down property. When two objects TOUCH (their blobs merge
+    into ONE connected component), the legacy bottom-up proposal returns ONE
+    candidate. The prediction-conditioned proposal returns TWO -- one per
+    prediction -- because identity is carried top-down (from the predictions),
+    not derived from touching pixels. This is the property the W3b blocker
+    (identity loss at contact) needs, at the proposal level."""
+    from agent.perception.proposal import (propose_regions,
+                                           propose_regions_conditioned)
+    img, a_xy, b_xy = _two_touching_blobs_frame()
+
+    # sanity: the LEGACY bottom-up proposal sees the two touching objects as
+    # ONE merged blob (one candidate). This is the bug we are fixing.
+    legacy = propose_regions(img, z_thresh=2.2)
+    assert len(legacy) == 1, (
+        f"sanity check failed: legacy proposal found {len(legacy)} candidates, "
+        f"expected 1 (the merged blob) -- the test scene is not reproducing "
+        f"the contact/merge condition; tune it")
+
+    # the conditioned proposal, given the TWO predicted positions (where each
+    # object expects to be), must return TWO claimed candidates -- one per
+    # object -- even though the blobs touch. radius generous enough to reach.
+    predictions = [(a_xy[0], a_xy[1], 14.0), (b_xy[0], b_xy[1], 14.0)]
+    claimed, residual = propose_regions_conditioned(img, predictions)
+    n_claimed = sum(1 for c in claimed if c is not None)
+    assert n_claimed == 2, (
+        f"conditioned proposal claimed {n_claimed} objects, expected 2 -- it "
+        f"did not keep both identities through the contact/merge. claimed: "
+        f"{[c is not None for c in claimed]}")
+    # the two claimed candidates sit at the two objects' centers (within the
+    # object size), not collapsed to one midpoint.
+    cas = [c for c in claimed if c is not None]
+    cx_a = min(c["cx"] for c in cas)
+    cx_b = max(c["cx"] for c in cas)
+    assert abs(cx_a - a_xy[0]) < 4.0 and abs(cx_b - b_xy[0]) < 4.0, (
+        f"claimed candidates at cx={cx_a:.1f},{cx_b:.1f} do not match the two "
+        f"objects' centers {a_xy[0]},{b_xy[0]} -- identity was not preserved")
+    # and nothing residual (both blobs were claimed).
+    assert len(residual) == 0, (
+        f"residual had {len(residual)} new-object candidates, expected 0 -- "
+        f"pixels that belong to known objects leaked into the new-object path")
+
+
+def test_conditioned_proposal_finds_new_objects_in_residual():
+    """The bottom-up path is demoted (not deleted): salient pixels NO track\n    claims still become NEW-object candidates. A brand-new object appearing\n    away from any prediction must be found in the residual. This is the\n    'surprise / new thing' path -- general, keeps cold-start working."""
+    from agent.perception.proposal import propose_regions_conditioned
+    img, a_xy, b_xy = _two_touching_blobs_frame()
+    # a third, separate bright object nowhere near any prediction
+    img2 = img.copy()
+    img2[120:132, 120:132] = 220   # new object at ~ (126, 126)
+    # predict only the two known objects; the third is unclaimed -> residual
+    predictions = [(a_xy[0], a_xy[1], 14.0), (b_xy[0], b_xy[1], 14.0)]
+    claimed, residual = propose_regions_conditioned(img2, predictions)
+    assert sum(1 for c in claimed if c is not None) == 2, "known objects not claimed"
+    assert len(residual) >= 1, (
+        "the new (unpredicted) object was not found in the residual -- the "
+        "bottom-up 'new things' path is broken")
+    new = residual[0]
+    assert abs(new["cx"] - 126.0) < 4.0 and abs(new["cy"] - 126.0) < 4.0, (
+        f"residual new object at ({new['cx']:.1f},{new['cy']:.1f}), expected "
+        f"~(126,126) -- the wrong residual was found")
+
+
+def test_conditioned_proposal_coasts_when_object_not_visible():
+    """If a predicted object has NO salient pixels in its radius (it is fully\n    occluded / not visible), the conditioned proposal returns None for that\n    prediction -- signalling the tracker to COAST it (carry identity through\n    the gap) rather than collapse it. The honest 'object not seen now' path."""
+    from agent.perception.proposal import propose_regions_conditioned
+    img, a_xy, b_xy = _two_touching_blobs_frame()
+    # predict a third object somewhere there is nothing bright -> None
+    predictions = [(a_xy[0], a_xy[1], 14.0), (50.0, 50.0, 10.0)]
+    claimed, residual = propose_regions_conditioned(img, predictions)
+    assert claimed[0] is not None, "object A should be claimed"
+    assert claimed[1] is None, (
+        "a prediction with no salient pixels in its radius should return None "
+        "(coast signal), not a phantom candidate")
