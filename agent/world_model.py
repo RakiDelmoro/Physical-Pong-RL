@@ -83,13 +83,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Dimensionality cues (mirror agent/perception/tracker.py -- the scaffold's
-# object-kind signal, used to discover surfaces: an elongated stationary slot
-# is a surface; a compact moving slot bounces off it). General, no Pong vocab.
-DIM_COMPACT = "0d"
-DIM_ELONGATED = "1d"
-DIM_PLANAR = "2d"
-
 
 # =====================================================================
 # Frozen nonlinear basis -- random Fourier features (never trains).
@@ -302,10 +295,6 @@ class _LowerNet(nn.Module):
                 nn.init.zeros_(m.bias)
                 nn.init.normal_(m.weight, std=0.01)
 
-    def forward(self, x):
-        h = self.body(x)
-        return self.state_head(h), self.reward_head(h).squeeze(-1)
-
     def correction(self, h):
         """The BOUNDED state correction from a hidden vector."""
         return torch.tanh(self.state_head(h)) * self.CORR_SCALE
@@ -381,27 +370,19 @@ class WorldModel:
         # update so online learning stalls. MD pins each matrix's DIRECTION to
         # a fixed Frobenius sphere + learns per-row/per-column GAINS at their
         # own LR, so the angular update is set by the LR and does NOT decay.
-        # `use_md=False` falls back to plain Adam (for A/B measurement).
-        self._use_md = True
-        if self._use_md:
-            matrix_params, other_params = [], []
-            for sub in self._lower.modules():
-                if isinstance(sub, nn.Linear):
-                    matrix_params.append(sub.weight)
-                    other_params.append(sub.bias)
-            # GRUCell: weight_ih/weight_hh are matrices; biases are not.
-            matrix_params += [self._higher.weight_ih, self._higher.weight_hh]
-            other_params += [self._higher.bias_ih, self._higher.bias_hh]
-            # regime_scale Linear
-            matrix_params.append(self._regime_scale.weight)
-            other_params.append(self._regime_scale.bias)
-            self._opt = _MDOptimizer(matrix_params, other_params,
-                                     lr_dir=3e-4, lr_gain=3e-3)
-        else:
-            self._opt = torch.optim.Adam(
-                list(self._lower.parameters())
-                + list(self._higher.parameters())
-                + list(self._regime_scale.parameters()), lr=3e-4)
+        matrix_params, other_params = [], []
+        for sub in self._lower.modules():
+            if isinstance(sub, nn.Linear):
+                matrix_params.append(sub.weight)
+                other_params.append(sub.bias)
+        # GRUCell: weight_ih/weight_hh are matrices; biases are not.
+        matrix_params += [self._higher.weight_ih, self._higher.weight_hh]
+        other_params += [self._higher.bias_ih, self._higher.bias_hh]
+        # regime_scale Linear
+        matrix_params.append(self._regime_scale.weight)
+        other_params.append(self._regime_scale.bias)
+        self._opt = _MDOptimizer(matrix_params, other_params,
+                                 lr_dir=3e-4, lr_gain=3e-3)
         self._hx = torch.zeros(self.N_REGIME, device=self._device)
         # a small fixed RFF over the state history to seed the GRU's input
         # (gives the recurrent net a rich per-step input without training a
@@ -437,11 +418,6 @@ class WorldModel:
         self._slot_shape = {}      # per-slot (w, h) in normalized units (for surface extent)
         self._controlled_slot = None
         self._track_speeds = {}
-        # ---- WAY C (ContactNets): per-surface learned restitution e
-        # (coefficient of restitution). Default 1.0 (elastic); learned online
-        # from observed bounces as the ratio |v_after|/|v_before| along the
-        # normal. A SMOOTH scalar learned per event -- not a discontinuity.
-        self._restitution = {}    # slot -> e (running EMA)
 
     # ---- state construction from perception's tracks (UNCHANGED) ----
     def _new_slot(self):
@@ -820,39 +796,26 @@ class WorldModel:
         with torch.no_grad():
             self._hx = self._higher(prev_t, self._hx).detach()
 
-    # ---- prediction ----
-    def _predict(self, state, action, hx=None):
+    # ---- prediction (one-step) ----
+    def _predict(self, state, action):
         """Return (predicted ABSOLUTE next state, predicted reward) for (s, a).
 
         Lower level: physics_default + correction(s, a), where the correction
         is MODULATED by the higher-level regime (the GRU hidden state). The
         regime is read from the recent state history -- a longer-timescale
-        signal that can foresee the rare bounce from the approach pattern.
-
-        If `hx` is given (rollout), use it as the regime state and return the
-        NEXT regime state too, so a rollout can carry the regime forward."""
+        signal. Used for one-step prediction (reward foresight, velocity hints);
+        the multi-step ROLLOUT does NOT use this (it uses the exact physics
+        default + the computed Way C bounce -- see rollout)."""
         self._lower.eval()
         feat = self._features_t(state, action)
         h = self._lower.body(feat)
-        regime = self._hx if hx is None else hx
-        mod = torch.sigmoid(self._regime_scale(regime))
+        mod = torch.sigmoid(self._regime_scale(self._hx))
         h_mod = h * mod
         pred_corr = self._lower.correction(h_mod).detach().cpu().numpy()
         pred_r = float(self._lower.reward_head(h_mod).detach().reshape(()).cpu().numpy())
         default_next = self._physics_default(state)
         next_state = default_next + pred_corr
-        # advance the regime for rollout carry-forward
-        with torch.no_grad():
-            next_hx = self._higher(self._state_t(state), regime)
-        if hx is None:
-            return next_state, pred_r
-        # in rollout mode, also return the imagined SURPRISE = the norm of the
-        # learned correction (the deviation from the physics default) -- the
-        # same signal used to detect real-stream events, applied to an imagined
-        # frame so the dynamic rollout can stop when its own imagination is
-        # no longer believable.
-        corr_norm = float(np.linalg.norm(pred_corr))
-        return next_state, pred_r, next_hx, corr_norm
+        return next_state, pred_r
 
     # ---- model-assisted coast (close the perception<->model loop) ----
     def velocity_hint(self, track):
@@ -1160,8 +1123,9 @@ class WorldModel:
             # was discovered), so use the discovered plane position `spos`
             # directly -- not the imagined slot position (the live slot may
             # churn, and the plane doesn't move along the normal anyway).
-            # (restitution e for this surface -- learned scalar, default 1.0)
-            e = float(self._restitution.get(spos, 1.0))
+            # elastic reflection (e=1.0; learning a per-surface restitution
+            # is a future refinement -- the rare-event wall is already
+            # sidestepped by computing the bounce).
             for i in range(self.MAX_OBJECTS):
                 if i == s_slot:
                     continue
@@ -1189,24 +1153,18 @@ class WorldModel:
                     # the plane)
                     if ((p_b - spos) > 0 and v < 0) or ((p_b - spos) < 0 and v > 0):
                         # reflect normal velocity, clamp position to the surface
-                        s[ij + 2 + axis] = -e * v
+                        s[ij + 2 + axis] = -v
                         s[ij + axis] = spos + np.sign(p_b - spos) * (half + 1e-4)
         return s
 
     def rollout(self, tracks, first_action, action_fn, horizon=20,
-                controlled_id=None, dynamic=True, pure_physics=False):
+                controlled_id=None, dynamic=True):
         """Imagine forward from the current state. Each imagined step =
-        physics_default + regime-modulated correction; the regime is carried
-        forward in the imagined future (the higher level fires on the imagined
-        approach pattern -- this is what makes an imagined bounce sharp).
-        All in the agent's head; the servo never moves.
-
-        pure_physics : if True, apply ONLY the physics default + the Way C
-          contact reflection (no learned smooth correction). The physics
-          default is EXACT for free flight (cx += vx); the learned correction
-          can be wrong (corrupted weights) and hurt imagination. This mode
-          tests the principle: imagination = exact kinematics + computed
-          bounces. Diagnostic / a candidate default.
+        EXACT physics default (free-flight kinematics) + the COMPUTED Way C
+        contact reflection (a bounce is generated by a rule, not learned --
+        the rare-event wall sidestepped). The reward is predicted by the net
+        (cheap, does not affect the imagined state). All in the agent's head;
+        the servo never moves.
 
         DYNAMIC rollout (the honest version of imagination): STOP as soon as
         the imagination becomes unrealistic, detected by the model's own
@@ -1223,8 +1181,7 @@ class WorldModel:
         first_action : action at the FIRST imagined step.
         action_fn(s, t) -> action : chooses each subsequent imagined action.
         dynamic : if True (default), stop on unrealistic imagination; if False,
-          run the full `horizon` (the old fixed-length behavior, kept for
-          comparison / diagnostics).
+          run the full `horizon`.
 
         Returns (states, rewards, cumulative_reward, meta) where meta =
         {"stop_reason": str|None, "stopped_at": int} -- stopped_at is the
@@ -1235,7 +1192,6 @@ class WorldModel:
         states = [s.copy()]
         rewards = []
         a = int(first_action)
-        hx = self._hx
         stop_reason = None
         t = 0
         # WAY C: discover surfaces ONCE from the recent real-stream history
@@ -1244,22 +1200,20 @@ class WorldModel:
         surfaces = self._discover_surfaces()
         for t in range(horizon):
             s_before = s
-            if pure_physics:
-                # physics default only (exact free-flight kinematics) +
-                # reward prediction from the net (cheap, doesn't affect state)
-                s = self._physics_default(s)
-                _, r = self._predict(s_before, a)
-                corr_norm = 0.0
-            else:
-                s, r, hx, corr_norm = self._predict(s, a, hx=hx)
+            # physics default (exact free-flight kinematics) + reward from the
+            # net (does not affect the imagined state). The learned STATE
+            # correction is NOT applied in the rollout -- the physics default
+            # is exact for free flight, and the correction (trained on the
+            # now-fixed residual) only adds drift until it relearns.
+            s = self._physics_default(s)
+            _, r = self._predict(s_before, a)
             # WAY C: the COMPUTED bounce -- reflect moving slots that cross a
-            # discovered surface. The discontinuity is generated by a rule, not
-            # learned (the rare-event wall sidestepped).
+            # discovered surface.
             s = self._apply_contact_reflection(s_before, s, surfaces)
             states.append(s.copy())
             rewards.append(float(r))
             if dynamic:
-                bad, why = self._is_unrealistic(s, corr_norm)
+                bad, why = self._is_unrealistic(s, 0.0)
                 if bad:
                     stop_reason = why
                     break

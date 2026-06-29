@@ -413,22 +413,16 @@ class ObjectTracker:
     # Pong vocabulary.
 
     def predictions(self):
-        """Per-track predicted pixel positions + search radius + priority +
-        min-dim, for the prediction-conditioned proposal. One
-        (px, py, radius, priority, min_dim) per track, in self._tracks order.
-        The radius is the SAME continuity gate the legacy matcher uses
-        (GATE_POS + a velocity margin). `priority` = track age (the
-        duplicate-suppression tiebreak: an established track keeps the blob
-        over a younger co-located one). `min_dim` = min(track w, h) px (sets
-        the co-location threshold -- half the smaller object's min dim)."""
+        """Per-track predicted pixel positions + search radius, for the
+        prediction-conditioned proposal. One (px, py, radius) per track, in
+        self._tracks order. The radius is the SAME continuity gate the legacy
+        matcher uses (GATE_POS + a velocity margin)."""
         out = []
         for t in self._tracks:
             px, py = t._predicted()
             speed = (t.vx ** 2 + t.vy ** 2) ** 0.5
             radius = self.GATE_POS + 2.0 * speed
-            priority = float(t.age)
-            min_dim = float(max(min(t.w, t.h), 1.0))
-            out.append((px, py, radius, priority, min_dim))
+            out.append((px, py, radius))
         return out
 
     def update_conditioned(self, claimed, residual, frame, action=None,
