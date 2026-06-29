@@ -111,6 +111,156 @@ class RandomFourierFeatures:
 
 
 # =====================================================================
+# Magnitude-Direction Decoupled optimizer (Hägele et al. 2026,
+# arXiv:2606.25971). See WORLD_MODEL_PLAN.md 'MD Decoupling'.
+# =====================================================================
+# The root-cause fix for long-run drift in the online/continual world model.
+# Plain Adam updates a weight matrix's DIRECTION and MAGNITUDE tangled
+# together: the magnitude creeps up on its own (updates are ~perpendicular
+# to the weight, so the norm inflates even with no radial gradient), which
+# silently SHRINKS the directional update (angular change ~ ||dW||/||W||),
+# so online learning slows down and predictions drift -- exactly the W2
+# degradation we measured (foresight 0.857 -> 0.725 over 5000 frames).
+# Weight decay only patches this indirectly (shrinks the norm to fight the
+# creep) and distorts the LR schedule.
+#
+# MD Decoupling factorizes each 2D weight W into a fixed-norm DIRECTION on a
+# Frobenius sphere + learnable per-row and per-column GAINS (softplus-
+# reparameterized so they stay positive), updated at SEPARATE learning rates:
+#     W = diag(g_row) * What * diag(g_col),   ||What||_F = R (fixed)
+# The direction cannot inflate (pinned to the sphere), so the LR directly
+# sets the angular update at every step and the rate does NOT decay over
+# training. The gains recover the fine-grained scale control that pinning the
+# norm gives up. The model sees the single fused weight W (Algorithm 2 of the
+# paper). No weight decay, no warmup. GENERAL (an optimizer fix, no Pong
+# knowledge); also helps the corrupted-history bounce relearn at a steady,
+# non-decaying rate (the virtuous cycle that stalled under plain Adam).
+#
+# Non-matrix params (biases) use plain Adam. Gradient clipping is applied to
+# the full parameter set first (unchanged from the prior plain-Adam path).
+
+class _MDOptimizer:
+    """Magnitude-Direction Decoupled optimizer for the world model's learned
+    net. Matrix-shaped (2D) parameters get the MD factorization; biases and
+    any non-2D params get plain Adam. The model always sees the fused weight.
+
+    Spheres use the INIT Frobenius norm as the radius (so the initial weight
+    is unchanged -- gains start at softplus-inv(1) ~= 0.541, i.e. gain = 1,
+    and What = W_init; no scale reset, so an already-trained net is not
+    disturbed). Only the UPDATE DYNAMICS change, which is the point."""
+
+    def __init__(self, matrix_params, other_params,
+                 lr_dir=3e-4, lr_gain=3e-3, eps=1e-8, betas=(0.9, 0.999)):
+        self._lr_dir = float(lr_dir)
+        self._lr_gain = float(lr_gain)
+        self._eps = float(eps)
+        self._b1, self._b2 = float(betas[0]), float(betas[1])
+        self._t = 0
+        self._md = {}          # id(p) -> state dict (lazy init on first step)
+        self._matrix = []      # the 2D params, in a stable order
+        for p in matrix_params:
+            if p.dim() == 2:
+                self._md[id(p)] = None
+                self._matrix.append(p)
+            else:
+                other_params = list(other_params) + [p]
+        self._other = list(other_params)
+        self._adam_other = (torch.optim.Adam(self._other, lr=lr_dir, eps=eps,
+                                             betas=betas)
+                            if self._other else None)
+
+    # ---- softplus gain map + its derivative + the inverse for init ----
+    @staticmethod
+    def _sp(x):
+        return torch.nn.functional.softplus(x)
+    @staticmethod
+    def _sp_inv(y):
+        # y > 0; softplus(x) = log(1+e^x) = y  ->  x = log(e^y - 1)
+        return torch.log(torch.expm1(y) + 1e-12)
+    @staticmethod
+    def _sp_grad(x):
+        return torch.sigmoid(x)
+
+    def zero_grad(self):
+        for p in self._matrix + self._other:
+            if p.grad is not None:
+                p.grad.detach_(); p.grad.zero_()
+
+    def _adam_step(self, t, grad, m, v, lr):
+        """Manual Adam update on a tensor; returns the updated tensor. Bias-
+        correction uses the optimizer's global step count."""
+        m.mul_(self._b1).add_(grad, alpha=1.0 - self._b1)
+        v.mul_(self._b2).addcmul_(grad, grad, value=1.0 - self._b2)
+        bc1 = 1.0 - self._b1 ** self._t
+        bc2 = 1.0 - self._b2 ** self._t
+        mhat = m / bc1
+        vhat = v / bc2
+        return t - lr * mhat / (vhat.sqrt() + self._eps)
+
+    def step(self):
+        self._t += 1
+        for p in self._matrix:
+            if p.grad is None:
+                continue
+            st = self._md[id(p)]
+            G = p.grad
+            if st is None:
+                # lazy init: sphere radius = init Frobenius norm; What = W_init;
+                # gains -> 1 (raw = softplus-inv(1)).
+                R = float(p.data.norm(p='fro').item())
+                R = R if R > 1e-8 else 1.0
+                out_, in_ = p.shape
+                dev, dt = p.device, p.dtype
+                one = torch.tensor(1.0, device=dev, dtype=dt)
+                ghat_row = self._sp_inv(one).expand(out_).clone().to(dev)
+                ghat_col = self._sp_inv(one).expand(in_).clone().to(dev)
+                What = p.data.clone()
+                st = {
+                    "R": R,
+                    "What": What,
+                    "ghat_row": ghat_row,
+                    "ghat_col": ghat_col,
+                    "m_w": torch.zeros_like(What), "v_w": torch.zeros_like(What),
+                    "m_gr": torch.zeros_like(ghat_row), "v_gr": torch.zeros_like(ghat_row),
+                    "m_gc": torch.zeros_like(ghat_col), "v_gc": torch.zeros_like(ghat_col),
+                }
+                self._md[id(p)] = st
+            R = st["R"]
+            What = st["What"]
+            ghat_row, ghat_col = st["ghat_row"], st["ghat_col"]
+            g_row = self._sp(ghat_row)          # (out,)
+            g_col = self._sp(ghat_col)          # (in,)
+            # 1. recover the on-sphere direction from the fused weight
+            What = (p.data / g_row.unsqueeze(1)) / g_col.unsqueeze(0)
+            # 2. gain gradients (Algorithm 2):  Wg = What * G (elementwise)
+            Wg = What * G
+            g_grow = (Wg * g_col.unsqueeze(0)).sum(dim=1)        # rowsum(Wg diag(g_col))
+            g_gcol = (g_row.unsqueeze(1) * Wg).sum(dim=0)       # colsum(diag(g_row) Wg)
+            # backprop through softplus
+            g_ghat_row = g_grow * self._sp_grad(ghat_row)
+            g_ghat_col = g_gcol * self._sp_grad(ghat_col)
+            # 3. direction gradient: G_What = diag(g_row) G diag(g_col)
+            G_what = g_row.unsqueeze(1) * G * g_col.unsqueeze(0)
+            # 4. Adam step on the direction, then project back onto the sphere
+            What_new = self._adam_step(What, G_what, st["m_w"], st["v_w"],
+                                       self._lr_dir)
+            What_new = What_new / What_new.norm(p='fro') * R
+            st["What"] = What_new
+            # 5. Adam step on the raw gains (own LR)
+            st["ghat_row"] = self._adam_step(ghat_row, g_ghat_row,
+                                             st["m_gr"], st["v_gr"], self._lr_gain)
+            st["ghat_col"] = self._adam_step(ghat_col, g_ghat_col,
+                                             st["m_gc"], st["v_gc"], self._lr_gain)
+            # 6. reassemble the fused weight for the next forward
+            g_row_new = self._sp(st["ghat_row"])
+            g_col_new = self._sp(st["ghat_col"])
+            with torch.no_grad():
+                p.data.copy_(g_row_new.unsqueeze(1) * What_new * g_col_new.unsqueeze(0))
+        if self._adam_other is not None:
+            self._adam_other.step()
+
+
+# =====================================================================
 # The lower level -- an MLP that predicts the RESIDUAL correction + reward.
 # =====================================================================
 
@@ -208,7 +358,6 @@ class WorldModel:
         self._lower = _LowerNet(self.basis.out_dim, self.state_dim,
                                 hidden=self._hidden, seed=seed
                                 ).to(self._device)
-        self._opt = torch.optim.Adam(self._lower.parameters(), lr=3e-4)
         # ---- higher level (a small RNN over the state history -> regime) ----
         # The regime MODULATES the lower net's hidden representation: it
         # scales the post-body hidden vector element-wise before the heads.
@@ -218,8 +367,34 @@ class WorldModel:
         self._higher = nn.GRUCell(self.state_dim, self.N_REGIME).to(self._device)
         self._regime_scale = nn.Linear(self.N_REGIME,
                                        self._hidden).to(self._device)
-        self._opt.add_param_group({"params": self._higher.parameters()})
-        self._opt.add_param_group({"params": self._regime_scale.parameters()})
+        # ---- optimizer: Magnitude-Direction Decoupling (arXiv:2606.25971) ----
+        # The root-cause fix for the measured long-run drift (W2 foresight
+        # 0.857 -> 0.725 over 5000 frames under plain Adam, no weight decay):
+        # the weight magnitude creeps up, silently shrinking the directional
+        # update so online learning stalls. MD pins each matrix's DIRECTION to
+        # a fixed Frobenius sphere + learns per-row/per-column GAINS at their
+        # own LR, so the angular update is set by the LR and does NOT decay.
+        # `use_md=False` falls back to plain Adam (for A/B measurement).
+        self._use_md = True
+        if self._use_md:
+            matrix_params, other_params = [], []
+            for sub in self._lower.modules():
+                if isinstance(sub, nn.Linear):
+                    matrix_params.append(sub.weight)
+                    other_params.append(sub.bias)
+            # GRUCell: weight_ih/weight_hh are matrices; biases are not.
+            matrix_params += [self._higher.weight_ih, self._higher.weight_hh]
+            other_params += [self._higher.bias_ih, self._higher.bias_hh]
+            # regime_scale Linear
+            matrix_params.append(self._regime_scale.weight)
+            other_params.append(self._regime_scale.bias)
+            self._opt = _MDOptimizer(matrix_params, other_params,
+                                     lr_dir=3e-4, lr_gain=3e-3)
+        else:
+            self._opt = torch.optim.Adam(
+                list(self._lower.parameters())
+                + list(self._higher.parameters())
+                + list(self._regime_scale.parameters()), lr=3e-4)
         self._hx = torch.zeros(self.N_REGIME, device=self._device)
         # a small fixed RFF over the state history to seed the GRU's input
         # (gives the recurrent net a rich per-step input without training a
