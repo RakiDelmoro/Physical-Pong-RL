@@ -392,6 +392,15 @@ class WorldModel:
                                                  seed=seed + 1)
         self._state_hist = []   # list of recent states (np arrays) for rollout
         self._action_hist = []  # aligned action history (for the controlled-
+        # FULL (untrimmed) state + action history, for the controlled-object
+        # action->motion model (a short window can be all-one-action -> no
+        # slope; the full history guarantees enough action variation).
+        self._state_hist_full = []
+        self._acts_full = []
+        # the controlled track's perception velocity history, for the
+        # action->motion model (clean: track-id identity is stable). List of
+        # (action, vx_px, vy_px) for the controlled track each frame.
+        self._ctrl_track_vel = []
                                 # object correlation query; see controlled_track)
         # a SEPARATE, longer history for the controlled-object correlation
         # query (the DPC higher level's _state_hist is only HIST_LEN=8, too
@@ -654,10 +663,28 @@ class WorldModel:
         the higher-level regime modulation. Online, one update per frame."""
         reward_delta = float(reward_delta)
         cur_state = self.state_from_tracks(tracks, controlled_id)
+        # record the controlled track's perception velocity for the action
+        # model (clean, track-id-stable; the slot-state signal is churn-noisy)
+        if controlled_id is not None:
+            for t in tracks:
+                if t["id"] == controlled_id:
+                    self._ctrl_track_vel.append(
+                        (int(action), float(t.get("vx", 0.0)),
+                         float(t.get("vy", 0.0))))
+                    if len(self._ctrl_track_vel) > 300:
+                        self._ctrl_track_vel.pop(0)
+                    break
         # maintain the state + action histories for the higher level and for
         # the controlled-object correlation query (controlled_track).
         self._state_hist.append(cur_state.copy())
         self._action_hist.append(int(action))
+        self._state_hist_full.append(cur_state.copy())
+        self._acts_full.append(int(action))
+        # cap the full history (keep enough for a stable action-model fit;
+        # not the whole session -- a few hundred frames is plenty and bounds
+        # memory).
+        if len(self._state_hist_full) > 600:
+            self._state_hist_full.pop(0); self._acts_full.pop(0)
         if len(self._state_hist) > self.HIST_LEN:
             self._state_hist.pop(0)
         if len(self._action_hist) > self.HIST_LEN:
@@ -1106,6 +1133,81 @@ class WorldModel:
             out.append((live_slot, normal_axis, plane_pos, half_extent))
         return out
 
+    # ==================================================================
+    # The controlled object's action->motion model (DISCOVERED, for the
+    # rollout). Without this, the imagined controlled object ignores the
+    # imagined action, so every action imagines the same future -> a planner
+    # cannot discriminate. GENERAL: 'the object I control moves along the
+    # axis and at the rate my action has empirically moved it' -- discovered
+    # from the action/position-delta correlation history (the SAME history
+    # controlled_track uses), no Pong vocabulary.
+    # ==================================================================
+    def _controlled_action_model(self):
+        """Return (axis, gain_per_action_scalar, neutral) for the controlled
+        object, or None -- discovered from the controlled TRACK's perception
+        velocity vs the action (clean: the track id has stable identity, so
+        no slot-churn contamination). `axis` is 0 (x) or 1 (y); `gain` is the
+        per-frame velocity per unit of the signed action scalar (the action's
+        effect on the controlled object's motion), in normalized units.
+        GENERAL: 'the object I control moves at the rate my action has
+        empirically moved it.'"""
+        if self._controlled_slot is None or self.n_obs < 200:
+            return None
+        hist = self._ctrl_track_vel   # list of (action, vx, vy) for the ctrl track
+        if len(hist) < 60:
+            return None
+        neutral = self.num_actions - 1
+        def scalar(a):
+            a = int(a)
+            if a == neutral: return 0.0
+            return +1.0 if a < neutral else -1.0
+        sc = np.array([scalar(h[0]) for h in hist], dtype=np.float64)
+        sc0 = sc - sc.mean()
+        if float(np.sqrt((sc0 ** 2).sum())) < 1e-9:
+            return None   # no action variation -> can't fit a slope
+        best_axis, best_gain = None, 0.0
+        for axis in (0, 1):
+            v = np.array([h[1 + axis] for h in hist], dtype=np.float64)
+            v = v - v.mean()
+            vv = float(np.sqrt((v ** 2).sum()))
+            if vv < 1e-9:
+                continue
+            denom = float((sc0 ** 2).sum())
+            if denom < 1e-12:
+                continue
+            gain = float((v * sc0).sum() / denom)
+            if abs(gain) > abs(best_gain):
+                best_gain, best_axis = gain, axis
+        if best_axis is None or abs(best_gain) < 1e-3:
+            return None
+        # gain is px/frame; normalize to the state's normalized units
+        norm = self.frame_h if best_axis == 1 else self.frame_w
+        return (best_axis, best_gain / norm, neutral)
+
+    def _apply_action_effect(self, s, action, action_model):
+        """In the imagination, the controlled object moves under the imagined
+        action: set its position-delta this step to the action's signed
+        effect (discovered gain * the action scalar), overriding the physics-
+        default drift for that one slot. GENERAL: 'the object I control goes
+        where my action sends it.'"""
+        if action_model is None or self._controlled_slot is None:
+            return s
+        axis, gain, neutral = action_model
+        a = int(action)
+        scalar = 0.0 if a == neutral else (+1.0 if a < neutral else -1.0)
+        # override the controlled slot's position advance along `axis` with
+        # the action's effect (the physics default already advanced it by its
+        # velocity; we ADD the action's delta on top -- a real paddle moves
+        # both from its inertia and the action).
+        j = self._controlled_slot * self.STATE_PER_OBJ
+        s = s.copy()
+        s[j + axis] += gain * scalar
+        # reflect the action into the slot's velocity too (so the next physics
+        # default carries it): set the velocity along the axis to the action's
+        # per-step delta. This keeps the imagined paddle's motion consistent.
+        s[j + 2 + axis] = gain * scalar
+        return s
+
     def _apply_contact_reflection(self, s_before, s_after, surfaces):
         """The COMPUTED bounce (ContactNets' complementarity, made simple): if
         a moving slot CROSSES a discovered surface's plane along the normal,
@@ -1157,9 +1259,26 @@ class WorldModel:
                         s[ij + axis] = spos + np.sign(p_b - spos) * (half + 1e-4)
         return s
 
+    def rollout_from_state(self, state, first_action, action_fn, horizon=20,
+                controlled_id=None, dynamic=True):
+        """Imagine forward from a given state (rollout's tracks-free variant;
+        the policy planner already has a state and doesn't need to rebuild it
+        from tracks). Same semantics as rollout."""
+        return self._rollout(state, first_action, action_fn, horizon,
+                             controlled_id, dynamic)
+
     def rollout(self, tracks, first_action, action_fn, horizon=20,
                 controlled_id=None, dynamic=True):
-        """Imagine forward from the current state. Each imagined step =
+        """Imagine forward from the current tracks. Builds the state from
+        tracks, then delegates to _rollout. See rollout_from_state for the
+        full semantics."""
+        s = self.state_from_tracks(tracks, controlled_id)
+        return self._rollout(s, first_action, action_fn, horizon,
+                             controlled_id, dynamic)
+
+    def _rollout(self, s, first_action, action_fn, horizon,
+                 controlled_id, dynamic):
+        """Imagine forward from a state. Each imagined step =
         EXACT physics default (free-flight kinematics) + the COMPUTED Way C
         contact reflection (a bounce is generated by a rule, not learned --
         the rare-event wall sidestepped). The reward is predicted by the net
@@ -1188,7 +1307,6 @@ class WorldModel:
         number of imagined steps taken (== horizon if it ran the full way).
         states always includes the starting state, so len(states) ==
         stopped_at + 1."""
-        s = self.state_from_tracks(tracks, controlled_id)
         states = [s.copy()]
         rewards = []
         a = int(first_action)
@@ -1198,6 +1316,15 @@ class WorldModel:
         # (they barely move, so the start-of-rollout snapshot is valid through
         # the imagined horizon; re-discovering each step is unnecessary).
         surfaces = self._discover_surfaces()
+        # the controlled object's action->motion model (DISCOVERED from the
+        # action/position-delta correlation history): which axis the action
+        # moves it on, the sign, and the magnitude per action unit. Without
+        # this, the imagined controlled object drifts at its current velocity
+        # regardless of the imagined action -> the imagined future is the same
+        # for every action -> a planner cannot discriminate. GENERAL: 'the
+        # object I control moves along the axis and at the rate my action has
+        # empirically moved it.'
+        action_model = self._controlled_action_model()
         for t in range(horizon):
             s_before = s
             # physics default (exact free-flight kinematics) + reward from the
@@ -1206,6 +1333,8 @@ class WorldModel:
             # is exact for free flight, and the correction (trained on the
             # now-fixed residual) only adds drift until it relearns.
             s = self._physics_default(s)
+            # apply the imagined action's effect on the controlled object
+            s = self._apply_action_effect(s, a, action_model)
             _, r = self._predict(s_before, a)
             # WAY C: the COMPUTED bounce -- reflect moving slots that cross a
             # discovered surface.
