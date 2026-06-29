@@ -456,10 +456,28 @@ class ObjectTracker:
         for ti, t in enumerate(self._tracks):
             c = claimed[ti]
             if c is not None:
+                # KIND-CONSISTENCY gate: a track only accepts a candidate whose
+                # dimensionality matches its OWN kind. A 1d paddle must NOT
+                # accept a 0d compact blob (that is a DIFFERENT object -- the
+                # ball -- stuck to it); accepting it would hijack the ball's
+                # identity (the paddle track moves to the ball's position and
+                # flips to 0d, the ball track starves and dies -> no
+                # continuous velocity across the contact -> the W3b blocker).
+                # Reject the mismatched candidate -> the track coasts (object
+                # permanence) and the ball keeps its own track. GENERAL -- 'a
+                # track only owns pixels of its own object kind'; no Pong
+                # vocabulary (the dimensionality cue is a general scaffold
+                # property, not a Pong label).
+                cand_dim = classify_dim(c["aspect"], c["extent"],
+                                        min(c["w"], c["h"]))
+                if t.confirmed and t.dim is not None and cand_dim != t.dim \
+                        and t.dim != DIM_PLANAR:
+                    c = None   # mismatched kind -> coast instead of hijack
+            if c is not None:
                 t.update(c, frame, action=action)
                 if self.utility is not None:
                     self.utility.update(t, t.last_pred_err)
-            else:
+            if c is None:
                 hint = None
                 if velocity_hint_fn is not None:
                     hint = velocity_hint_fn(t.as_dict())
@@ -484,16 +502,21 @@ class ObjectTracker:
 
     def _fragments_of_one_object(self, a, b):
         # Two confirmed tracks that are NON-overlapping fragments of ONE
-        # elongated object, split along its long axis: aligned on one axis,
-        # adjacent (small gap) on the other, similar size, same velocity.
-        # (The conditioned path bypasses the legacy matcher's one-blob-one-
-        # track rule, so a tall paddle can persist as a top half + a bottom
-        # half -- the slot-exhaustion blocker. The halves touch but don't
-        # overlap, so a containment test misses them; this adjacency test
-        # catches them.) The ball is protected: it is ~0.2x a fragment's area
-        # (the similar-size guard rejects it) and it crosses the paddle
-        # orthogonally (the velocity-direction guard rejects it). GENERAL --
-        # 'two side-by-side same-sized same-velocity pieces of one object'.
+        # elongated object, split along its long axis: SAME dimensionality
+        # (both 1d elongated), aligned on one axis, adjacent (small gap) on
+        # the other, similar size, same velocity. (The conditioned path
+        # bypasses the legacy matcher's one-blob-one-track rule, so a tall
+        # paddle can persist as a top half + a bottom half -- the slot-
+        # exhaustion blocker. The halves touch but don't overlap, so a
+        # containment test misses them; this adjacency test catches them.)
+        # The ball is protected by the SAME-DIM guard: a ball (0d) stuck to a
+        # paddle (1d) is NOT a fragment of it, even when the paddle's carved
+        # blob is briefly mis-classified 0d by the proposal -- the ball is a
+        # DIFFERENT KIND of object (compact vs elongated). Two halves of one
+        # paddle are BOTH 1d. GENERAL -- 'two side-by-side same-shaped same-
+        # sized same-velocity pieces of one object'; no Pong vocabulary.
+        if a.dim != b.dim:
+            return False   # different object kinds -> never fragments of one
         ax0, ax1 = a.cx - a.w / 2, a.cx + a.w / 2
         ay0, ay1 = a.cy - a.h / 2, a.cy + a.h / 2
         bx0, bx1 = b.cx - b.w / 2, b.cx + b.w / 2
