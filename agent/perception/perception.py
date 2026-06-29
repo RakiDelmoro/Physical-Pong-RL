@@ -30,7 +30,7 @@ had no job once the labeler and the dynamics model became the same object.
 
 import numpy as np
 
-from .proposal import propose_regions
+from .proposal import propose_regions, propose_regions_conditioned
 from .tracker import ObjectTracker, BehaviorUtility
 
 
@@ -84,19 +84,37 @@ class Perception:
         self._step = 0
 
     def step(self, gray, action):
-        # Seed = top-K (rank-based, brightness-invariant). The legacy fixed-
-        # z-thresh path is reached ONLY if the caller explicitly set
-        # top_k=None and z_thresh=<value>; otherwise top-K. No silent fallback.
-        if self._top_k is not None:
-            cands = propose_regions(gray, top_k=self._top_k,
-                                    permissive_z=self._permissive_z)
-        elif self._z_thresh is not None:
-            cands = propose_regions(gray, z_thresh=self._z_thresh)
+        # TOP-DOWN when tracks exist: prediction-conditioned proposal. Each
+        # existing track's predicted position carves out its OWN candidate
+        # before connected components can merge anything, so identity is
+        # carried top-down and a contact/merge can no longer destroy it (the
+        # W3b blocker -- the ball losing its track at a paddle bounce).
+        # BOTTOM-UP when cold (no tracks yet): legacy top-K proposal, same as
+        # before -- cold start is unchanged. The bottom-up path is demoted to
+        # 'new things only' once tracks exist (the residual of the conditioned
+        # proposal). GENERAL -- no Pong vocabulary.
+        preds = self.tracker.predictions()
+        if preds:
+            claimed, residual = propose_regions_conditioned(
+                gray, preds, permissive_z=self._permissive_z)
+            tracks = self.tracker.update_conditioned(
+                claimed, residual, self._step,
+                action=self._last_action,
+                velocity_hint_fn=self._velocity_hint_fn)
         else:
-            cands = propose_regions(gray, top_k=6, permissive_z=self._permissive_z)
-        tracks = self.tracker.update(cands, self._step,
-                                     action=self._last_action,
-                                     velocity_hint_fn=self._velocity_hint_fn)
+            # cold start: legacy bottom-up proposal (top-K, brightness-
+            # invariant). Reached only when the tracker has no tracks.
+            if self._top_k is not None:
+                cands = propose_regions(gray, top_k=self._top_k,
+                                        permissive_z=self._permissive_z)
+            elif self._z_thresh is not None:
+                cands = propose_regions(gray, z_thresh=self._z_thresh)
+            else:
+                cands = propose_regions(gray, top_k=6,
+                                        permissive_z=self._permissive_z)
+            tracks = self.tracker.update(cands, self._step,
+                                         action=self._last_action,
+                                         velocity_hint_fn=self._velocity_hint_fn)
         self._last_action = int(action)
         self._step += 1
         # OPTION C: the controlled object is discovered by the world model

@@ -251,14 +251,46 @@ class WorldModel:
         self._slot_last = {}
         self._slot_frame = {}
         self._slot_speeds = {}
+        self._slot_dim = {}        # per-slot dimensionality cue ('0d'/'1d'/'2d')
         self._controlled_slot = None
         self._track_speeds = {}
 
     # ---- state construction from perception's tracks (UNCHANGED) ----
     def _new_slot(self):
+        # Fresh slot index, MONOTONIC but bounded by MAX_OBJECTS. Recycling
+        # of dead slots (occupant churned) is handled by _merge_by_kind /
+        # _nearest_free_slot (which reuse dead slots of matching kind/pos) and
+        # the _recycle_dead_slot fallback in state_from_tracks (for when no
+        # dead slot matches and the monotonic counter is exhausted -- the
+        # ball-resets-often case: every reset is a new track id needing a
+        # slot, so a non-recycling counter permanently starves new objects).
         i = self._next_slot
         self._next_slot += 1
         return i
+
+    def _recycle_dead_slot(self, claimed, live_slots):
+        # When the monotonic _next_slot has passed MAX_OBJECTS, reuse a slot
+        # index that is NOT occupied this frame (not in `claimed`, not in
+        # `live_slots`). This covers BOTH dead slots still in _slot_speeds
+        # (occupant churned) AND indices that were consolidated out of
+        # _slot_speeds (which _new_slot can no longer hand out and a
+        # _slot_speeds-only scan would miss -- the bug that starved new ball
+        # track ids of slots). Picks the smallest free index. Returns None
+        # only if every slot index is occupied this frame (genuinely full).
+        used = set(claimed) | set(live_slots)
+        for i in range(self.MAX_OBJECTS):
+            if i not in used:
+                return i
+        return None
+
+    def _reset_slot(self, slot):
+        # Clear a recycled slot's kind/pos history so the new occupant starts
+        # fresh (its dynamics are learned online; stale history would mislead
+        # kind-merging for FUTURE new tracks).
+        self._slot_speeds.pop(slot, None)
+        self._slot_last.pop(slot, None)
+        self._slot_frame.pop(slot, None)
+        self._slot_dim.pop(slot, None)
 
     def _nearest_free_slot(self, pos, claimed, exclude=None):
         best_slot, best_d = None, self.PERSIST_GATE
@@ -288,12 +320,17 @@ class WorldModel:
             return None
         return float(np.median(ss))
 
-    def _merge_by_kind(self, speed, claimed, exclude=None):
+    def _merge_by_kind(self, speed, dim, claimed, exclude=None):
         # DECOUPLED from controlled: `exclude` is the set of LIVE slots (still
         # occupied by a current track), not the controlled slot. A new track
         # merges only into a DEAD same-speed slot (its occupant churned/gone),
         # so the ball never folds into the paddle's live slot even when their
-        # speeds overlap. Controlled-independent.
+        # speeds overlap. Controlled-independent. ALSO requires a matching
+        # DIMENSIONALITY cue: a fast 0d ball and a fast-moving 1d paddle can
+        # have overlapping speeds in this scene, but they are different
+        # object KINDS -- a 0d track must not fold into a 1d slot (or the ball
+        # drops out of the state when the paddle churns). Shape-class is the
+        # kind signal speed alone lacked.
         best_slot, best_d = None, self.KIND_THRESH
         for slot in self._slot_speeds:
             if slot in claimed or (exclude is not None and slot in exclude):
@@ -301,6 +338,8 @@ class WorldModel:
             ks = self._slot_kind_speed(slot)
             if ks is None:
                 continue
+            if self._slot_dim.get(slot) != dim:
+                continue   # different object kind -> never share a slot
             d = abs(speed - ks)
             if d < best_d:
                 best_d, best_slot = d, slot
@@ -328,6 +367,8 @@ class WorldModel:
                 ka, kb = self._slot_kind_speed(a), self._slot_kind_speed(b)
                 if ka is None or kb is None:
                     continue
+                if self._slot_dim.get(a) != self._slot_dim.get(b):
+                    continue   # different object kinds -> never consolidate
                 if abs(ka - kb) < self.KIND_THRESH:
                     keep, drop = a, b
                     for tid, sl in list(self._slot_map.items()):
@@ -337,6 +378,7 @@ class WorldModel:
                     self._slot_speeds.pop(drop, None)
                     self._slot_last.pop(drop, None)
                     self._slot_frame.pop(drop, None)
+                    self._slot_dim.pop(drop, None)
                     return
 
     def state_from_tracks(self, tracks, controlled_id=None):
@@ -363,34 +405,45 @@ class WorldModel:
             vel = np.array([np.clip(t["vx"] / self.frame_w, -1.0, 1.0),
                             np.clip(t["vy"] / self.frame_h, -1.0, 1.0)])
             tid = t["id"]
+            dim = t.get("dim")            # dimensionality cue (the kind signal)
             slot = self._slot_map.get(tid)
             if slot is None or slot in claimed:
                 speed = self._kind_speed(t)
                 slot = None
-                if speed > 0.003:
-                    slot = self._merge_by_kind(speed, claimed,
+                if speed > 0.003 and dim is not None:
+                    slot = self._merge_by_kind(speed, dim, claimed,
                                                exclude=live_slots)
                 if slot is None:
                     slot = self._nearest_free_slot(pos, claimed,
                                                    exclude=live_slots)
                 if slot is None:
-                    if self._next_slot >= self.MAX_OBJECTS:
-                        continue
-                    slot = self._new_slot()
+                    if self._next_slot < self.MAX_OBJECTS:
+                        slot = self._new_slot()
+                    else:
+                        # monotonic slot space exhausted -- RECYCLE a dead
+                        # slot (occupant churned) so a new object (e.g. a
+                        # reset ball with a brand-new track id) still gets a
+                        # slot instead of being dropped from the state.
+                        slot = self._recycle_dead_slot(claimed, live_slots)
+                        if slot is None:
+                            continue   # all slots live -- genuinely full
+                        self._reset_slot(slot)
                 self._slot_map[tid] = slot
-            claimed[slot] = (pos, vel)
+            claimed[slot] = (pos, vel, dim)
         # NOTE: under option C, _controlled_slot is set ONLY by controlled_track
         # (the dynamics query). state_from_tracks no longer writes it from
         # controlled_id -- that was the circular write (controlled_track reads
         # the slots to discover controlled, then state_from_tracks rewrote
         # _controlled_slot from the controlled_id controlled_track returned).
         # controlled_id is still accepted (signature compat) but ignored here.
-        for slot, (pos, vel) in claimed.items():
+        for slot, (pos, vel, dim) in claimed.items():
             j = slot * self.STATE_PER_OBJ
             s[j + 0], s[j + 1] = pos[0], pos[1]
             s[j + 2], s[j + 3] = vel[0], vel[1]
             self._slot_last[slot] = (pos.copy(), vel.copy())
             self._slot_frame[slot] = self._frame
+            if dim is not None:
+                self._slot_dim[slot] = dim
             speed = float(np.hypot(vel[0], vel[1]))
             self._slot_speeds.setdefault(slot, []).append(speed)
             if len(self._slot_speeds[slot]) > 20:

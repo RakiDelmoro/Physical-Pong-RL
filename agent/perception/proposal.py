@@ -132,10 +132,13 @@ def propose_regions_conditioned(gray, predictions, z_thresh=2.2, min_area=4,
     """Prediction-conditioned proposal. Top-down for known objects, bottom-up
     for new ones.
 
-    `predictions` : list of (px, py, radius) -- each existing track's
-        predicted pixel position and a search radius (how far the object may
-        be from the prediction and still be claimed by that track). May be
-        empty (cold start -> pure bottom-up, same as propose_regions).
+    `predictions` : list of per-track prediction tuples. Each may be:
+        (px, py, radius)
+        (px, py, radius, priority)          # priority = track age (tiebreak)
+        (px, py, radius, priority, min_dim)  # min_dim = min(track w,h) px
+        `priority` (higher = more established) and `min_dim` default to 0.0
+        and 4.0, so legacy 3-tuple callers keep working. May be empty (cold
+        start -> pure bottom-up, same as propose_regions).
 
     Returns (claimed, residual) where:
       claimed  : list of candidates, ONE per input prediction (in the same
@@ -155,24 +158,68 @@ def propose_regions_conditioned(gray, predictions, z_thresh=2.2, min_area=4,
     ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_ksize, open_ksize))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ko)
 
+    # Parse predictions into (px, py, rad, priority, min_dim) rows.
+    preds = []
+    for p in predictions:
+        if len(p) >= 5:
+            px, py, rad, prio, md = p[0], p[1], p[2], p[3], p[4]
+        elif len(p) == 4:
+            px, py, rad, prio = p
+            md = 4.0
+        else:
+            px, py, rad = p
+            prio, md = 0.0, 4.0
+        preds.append((float(px), float(py), float(rad),
+                      float(prio), float(md)))
+
+    # ---- DUPLICATE-SUPPRESSION (the co-located-tracks fix). If two tracks'
+    #    predictions are within half the SMALLER object's smallest dimension,
+    #    they are tracking the SAME object (the conditioned path bypasses the
+    #    legacy matcher's one-blob-one-track rule, so a split here would
+    #    fragment one object into two half-width tracks -- the regression).
+    #    The LOWER-priority (younger) track is SUPPRESSED: it claims no pixels
+    #    this frame (-> coast) so the higher-priority (established) track
+    #    keeps the whole blob and the duplicate starves out. This does NOT
+    #    fire for a genuine CONTACT (ball vs paddle): their predictions are
+    #    separated by ~ball-radius + paddle-half-width -- MORE than half the
+    #    smaller object's min dim -- so the split is preserved. General: 'two
+    #    trackers on one object -> keep the established one'; no Pong vocab.
+    suppressed = [False] * len(preds)
+    for i in range(len(preds)):
+        if suppressed[i]:
+            continue
+        for j in range(len(preds)):
+            if i == j:
+                continue
+            pi, pj = preds[i], preds[j]
+            if pj[3] <= pi[3]:   # j not strictly more established
+                continue
+            d = ((pi[0] - pj[0]) ** 2 + (pi[1] - pj[1]) ** 2) ** 0.5
+            dup_dist = 0.5 * min(pi[4], pj[4])
+            if d < dup_dist:
+                suppressed[i] = True
+                break
+
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
-        claimed = [None] * len(predictions)
+        claimed = [None] * len(preds)
         return claimed, []
 
     pts = np.stack([xs, ys], axis=1).astype(np.float32)  # (N, 2)
 
-    # ---- assign each salient pixel to the NEAREST predicted track within
-    # that track's search radius (a Voronoi-like assignment conditioned on
-    # the predictions). A pixel claimed by NO track is 'residual' (new). ----
+    # ---- assign each salient pixel to the NEAREST NON-SUPPRESSED predicted
+    # track within that track's search radius (Voronoi conditioned on the
+    # predictions; suppressed predictions do not participate -- their pixels
+    # fall to the established co-located track). A pixel claimed by NO track
+    # is 'residual' (new). ----
     owner = np.full(len(pts), -1, dtype=np.int64)   # -1 = residual / new
-    if predictions:
+    if preds:
         best_d = np.full(len(pts), np.inf, dtype=np.float32)
-        for pi, (px, py, rad) in enumerate(predictions):
+        for pi, (px, py, rad, prio, md) in enumerate(preds):
+            if suppressed[pi]:
+                continue
             d = np.sqrt((pts[:, 0] - px) ** 2 + (pts[:, 1] - py) ** 2)
-            closer = d < best_d
-            within = d <= rad
-            take = closer & within
+            take = (d < best_d) & (d <= rad)
             owner[take] = pi
             best_d[take] = d[take]
 

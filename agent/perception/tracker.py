@@ -395,3 +395,156 @@ class ObjectTracker:
                             if not self.utility.should_retire(t)]
 
         return [t.as_dict() for t in self._tracks if t.confirmed]
+
+    # =====================================================================
+    # TOP-DOWN / prediction-conditioned path (step 2 of the contact fix).
+    # =====================================================================
+    # The legacy `update` above is BOTTOM-UP: it runs the Hungarian matcher
+    # over connected-component blobs, so the moment two objects touch they
+    # become ONE blob and the matcher can no longer give the ball its own
+    # candidate -- identity is gone before the matcher runs. The conditioned
+    # path replaces the matcher for KNOWN tracks: the proposal already carved
+    # out one candidate per track's prediction (Voronoi-by-prediction), so
+    # track i simply takes claimed[i]. Identity is carried top-down and a
+    # merge can no longer destroy it. The cohesion/continuity protection the
+    # matcher gave is subsumed by the per-track search radius (a track only
+    # claims pixels near its prediction -- a way-off prediction claims
+    # nothing -> coast, same as a continuity gate failing). GENERAL -- no
+    # Pong vocabulary.
+
+    def predictions(self):
+        """Per-track predicted pixel positions + search radius + priority +
+        min-dim, for the prediction-conditioned proposal. One
+        (px, py, radius, priority, min_dim) per track, in self._tracks order.
+        The radius is the SAME continuity gate the legacy matcher uses
+        (GATE_POS + a velocity margin). `priority` = track age (the
+        duplicate-suppression tiebreak: an established track keeps the blob
+        over a younger co-located one). `min_dim` = min(track w, h) px (sets
+        the co-location threshold -- half the smaller object's min dim)."""
+        out = []
+        for t in self._tracks:
+            px, py = t._predicted()
+            speed = (t.vx ** 2 + t.vy ** 2) ** 0.5
+            radius = self.GATE_POS + 2.0 * speed
+            priority = float(t.age)
+            min_dim = float(max(min(t.w, t.h), 1.0))
+            out.append((px, py, radius, priority, min_dim))
+        return out
+
+    def update_conditioned(self, claimed, residual, frame, action=None,
+                           velocity_hint_fn=None):
+        """The top-down path. `claimed` is a list aligned with self._tracks
+        (one candidate per track, carved out by the prediction-conditioned
+        proposal -- or None if no salient pixels were at that track's
+        prediction -> coast). `residual` is the list of new-object candidates
+        (salient pixels no track claimed -> the bottom-up path, demoted to
+        'new things only').
+
+        Track i takes claimed[i] directly (no matcher -- the conditioned
+        proposal already solved the assignment geometrically). Unseen tracks
+        coast (with a model-assisted velocity hint if provided). Residual
+        candidates start new tracks. Utility scoring + retirement run as in
+        the legacy path."""
+        if self.utility is not None and action is not None:
+            self.utility.note_action(action)
+        T = len(self._tracks)
+        if len(claimed) != T:
+            raise ValueError(
+                f"claimed (len {len(claimed)}) must align with tracks "
+                f"(len {T}) -- predictions() and update_conditioned() must "
+                f"be called with no tracker mutation in between")
+        for ti, t in enumerate(self._tracks):
+            c = claimed[ti]
+            if c is not None:
+                t.update(c, frame, action=action)
+                if self.utility is not None:
+                    self.utility.update(t, t.last_pred_err)
+            else:
+                hint = None
+                if velocity_hint_fn is not None:
+                    hint = velocity_hint_fn(t.as_dict())
+                t.coast(velocity_hint=hint)
+        # residual candidates -> new tracks (the bottom-up 'new things' path)
+        for c in residual:
+            self._tracks.append(Track(self._next_id, c, frame))
+            self._next_id += 1
+        self._tracks = [t for t in self._tracks if t.missed <= self.MAX_MISS]
+        # DUPLICATE-FRAGMENT DROP: the conditioned path can persist two
+        # non-overlapping halves of one elongated object (a tall paddle split
+        # top+bottom). Drop the younger half; the survivor reclaims the whole
+        # blob next frame. Ball-protected (see _fragments_of_one_object).
+        self._drop_duplicate_fragments()
+        # utility scoring + retirement (same as the legacy path)
+        if self.utility is not None:
+            for t in self._tracks:
+                t.utility = self.utility.score(t)
+            self._tracks = [t for t in self._tracks
+                            if not self.utility.should_retire(t)]
+        return [t.as_dict() for t in self._tracks if t.confirmed]
+
+    def _fragments_of_one_object(self, a, b):
+        # Two confirmed tracks that are NON-overlapping fragments of ONE
+        # elongated object, split along its long axis: aligned on one axis,
+        # adjacent (small gap) on the other, similar size, same velocity.
+        # (The conditioned path bypasses the legacy matcher's one-blob-one-
+        # track rule, so a tall paddle can persist as a top half + a bottom
+        # half -- the slot-exhaustion blocker. The halves touch but don't
+        # overlap, so a containment test misses them; this adjacency test
+        # catches them.) The ball is protected: it is ~0.2x a fragment's area
+        # (the similar-size guard rejects it) and it crosses the paddle
+        # orthogonally (the velocity-direction guard rejects it). GENERAL --
+        # 'two side-by-side same-sized same-velocity pieces of one object'.
+        ax0, ax1 = a.cx - a.w / 2, a.cx + a.w / 2
+        ay0, ay1 = a.cy - a.h / 2, a.cy + a.h / 2
+        bx0, bx1 = b.cx - b.w / 2, b.cx + b.w / 2
+        by0, by1 = b.cy - b.h / 2, b.cy + b.h / 2
+        ox = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+        oy = max(0.0, min(ay1, by1) - max(ay0, by0))
+        minw, minh = min(a.w, b.w), min(a.h, b.h)
+        aligned_x = ox > 0.6 * minw
+        aligned_y = oy > 0.6 * minh
+        if aligned_x and not aligned_y:
+            gap = max(0.0, max(ay0, by0) - min(ay1, by1))
+            if gap > 0.5 * minh:
+                return False
+        elif aligned_y and not aligned_x:
+            gap = max(0.0, max(ax0, bx0) - min(ax1, bx1))
+            if gap > 0.5 * minw:
+                return False
+        else:
+            return False
+        # similar size (within 2x): a fragment is a comparable chunk; the ball
+        # (~0.2x) is not.
+        lo = max(min(a.area, b.area), 1.0)
+        if max(a.area, b.area) > 2.0 * lo:
+            return False
+        # same velocity direction: a ball crossing a paddle moves
+        # orthogonally to it -> different object, keep both.
+        sa = (a.vx ** 2 + a.vy ** 2) ** 0.5
+        sb = (b.vx ** 2 + b.vy ** 2) ** 0.5
+        if sa > 1.0 and sb > 1.0:
+            cosang = (a.vx * b.vx + a.vy * b.vy) / (sa * sb)
+            if abs(cosang) < 0.5:
+                return False
+        return True
+
+    def _drop_duplicate_fragments(self):
+        tracks = self._tracks
+        drop = set()
+        for i in range(len(tracks)):
+            if i in drop or not tracks[i].confirmed:
+                continue
+            for j in range(i + 1, len(tracks)):
+                if j in drop or not tracks[j].confirmed:
+                    continue
+                if not self._fragments_of_one_object(tracks[i], tracks[j]):
+                    continue
+                # drop the YOUNGER (lower age; tiebreak higher id = younger);
+                # the survivor's prediction claims the whole blob next frame.
+                ai, bi = tracks[i], tracks[j]
+                if (ai.age, -ai.id) >= (bi.age, -bi.id):
+                    drop.add(j)
+                else:
+                    drop.add(i)
+        if drop:
+            self._tracks = [t for k, t in enumerate(tracks) if k not in drop]
