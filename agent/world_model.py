@@ -83,6 +83,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# Dimensionality cues (mirror agent/perception/tracker.py -- the scaffold's
+# object-kind signal, used to discover surfaces: an elongated stationary slot
+# is a surface; a compact moving slot bounces off it). General, no Pong vocab.
+DIM_COMPACT = "0d"
+DIM_ELONGATED = "1d"
+DIM_PLANAR = "2d"
+
 
 # =====================================================================
 # Frozen nonlinear basis -- random Fourier features (never trains).
@@ -427,8 +434,14 @@ class WorldModel:
         self._slot_frame = {}
         self._slot_speeds = {}
         self._slot_dim = {}        # per-slot dimensionality cue ('0d'/'1d'/'2d')
+        self._slot_shape = {}      # per-slot (w, h) in normalized units (for surface extent)
         self._controlled_slot = None
         self._track_speeds = {}
+        # ---- WAY C (ContactNets): per-surface learned restitution e
+        # (coefficient of restitution). Default 1.0 (elastic); learned online
+        # from observed bounces as the ratio |v_after|/|v_before| along the
+        # normal. A SMOOTH scalar learned per event -- not a discontinuity.
+        self._restitution = {}    # slot -> e (running EMA)
 
     # ---- state construction from perception's tracks (UNCHANGED) ----
     def _new_slot(self):
@@ -581,6 +594,8 @@ class WorldModel:
                             np.clip(t["vy"] / self.frame_h, -1.0, 1.0)])
             tid = t["id"]
             dim = t.get("dim")            # dimensionality cue (the kind signal)
+            shape = (float(t.get("w", 0.0)) / self.frame_w,
+                     float(t.get("h", 0.0)) / self.frame_h)
             slot = self._slot_map.get(tid)
             if slot is None or slot in claimed:
                 speed = self._kind_speed(t)
@@ -604,14 +619,14 @@ class WorldModel:
                             continue   # all slots live -- genuinely full
                         self._reset_slot(slot)
                 self._slot_map[tid] = slot
-            claimed[slot] = (pos, vel, dim)
+            claimed[slot] = (pos, vel, dim, shape)
         # NOTE: under option C, _controlled_slot is set ONLY by controlled_track
         # (the dynamics query). state_from_tracks no longer writes it from
         # controlled_id -- that was the circular write (controlled_track reads
         # the slots to discover controlled, then state_from_tracks rewrote
         # _controlled_slot from the controlled_id controlled_track returned).
         # controlled_id is still accepted (signature compat) but ignored here.
-        for slot, (pos, vel, dim) in claimed.items():
+        for slot, (pos, vel, dim, shape) in claimed.items():
             j = slot * self.STATE_PER_OBJ
             s[j + 0], s[j + 1] = pos[0], pos[1]
             s[j + 2], s[j + 3] = vel[0], vel[1]
@@ -619,6 +634,7 @@ class WorldModel:
             self._slot_frame[slot] = self._frame
             if dim is not None:
                 self._slot_dim[slot] = dim
+            self._slot_shape[slot] = shape
             speed = float(np.hypot(vel[0], vel[1]))
             self._slot_speeds.setdefault(slot, []).append(speed)
             if len(self._slot_speeds[slot]) > 20:
@@ -628,11 +644,20 @@ class WorldModel:
 
     # ---- the physics default (scaffold, exact, adaptive parameters) ----
     def _physics_default(self, state):
-        cur_pos = state[:self.pos_dim]
-        cur_vel = state[self.pos_dim:self.pos_dim + self.vel_dim]
-        next_pos = cur_pos + cur_vel
-        next_vel = cur_vel
-        return np.concatenate([next_pos, next_vel])
+        # INTERLEAVED layout: slot s occupies state[s*STATE_PER_OBJ : +4] =
+        # (cx, cy, vx, vy). Apply the universal kinematics 'position advances
+        # by velocity; velocity persists' PER SLOT. (The prior block-layout
+        # reading was a BUG -- it garbled the state, so the imagined ball never
+        # advanced correctly and imagination drifted. The residual + reward
+        # heads still trained because they learn whatever mapping the state
+        # carries, but the rollout's physics default was wrong.)
+        out = np.array(state, dtype=np.float64, copy=True)
+        for s in range(self.MAX_OBJECTS):
+            j = s * self.STATE_PER_OBJ
+            out[j + 0] += out[j + 2]   # next_cx = cx + vx
+            out[j + 1] += out[j + 3]   # next_cy = cy + vy
+            # next_vx, next_vy unchanged (velocity persists)
+        return out
 
     # ---- tensors ----
     def _features_t(self, state, action):
@@ -1023,10 +1048,15 @@ class WorldModel:
               imagination anymore."
         This is the honest stopping rule: imagination continues only as long
         as the model's own signals say it is still realistic."""
-        pos = state[:self.pos_dim]
+        # INTERLEAVED layout: positions are at slot*STATE_PER_OBJ + (0,1);
+        # velocities at + (2,3). Read them per-slot (the prior block-layout
+        # read was the same bug as _physics_default).
+        pos = np.array([state[s * self.STATE_PER_OBJ] for s in range(self.MAX_OBJECTS)] +
+                       [state[s * self.STATE_PER_OBJ + 1] for s in range(self.MAX_OBJECTS)])
         if np.any(pos < -0.05) or np.any(pos > 1.05):
             return True, "off_screen"
-        vel = state[self.pos_dim:self.pos_dim + self.vel_dim]
+        vel = np.array([state[s * self.STATE_PER_OBJ + 2] for s in range(self.MAX_OBJECTS)] +
+                       [state[s * self.STATE_PER_OBJ + 3] for s in range(self.MAX_OBJECTS)])
         if np.max(np.abs(vel)) > 0.3:
             return True, "velocity_explosion"
         med, mad = self._surprise_median_mad()
@@ -1034,13 +1064,149 @@ class WorldModel:
             return True, "surprise_spike"
         return False, None
 
+    # ====================================================================
+    # WAY C (ContactNets principle, adapted online): the bounce is COMPUTED,
+    # not learned. A 'surface' is DISCOVERED from the stream as a slot that is
+    # elongated (1d) and approximately STATIONARY along one axis -- that axis
+    # is the surface NORMAL (the direction things bounce off it). GENERAL:
+    # 'a surface is an object that doesn't move in the direction things bounce
+    # off it' -- true for walls, floors, paddles, ceilings in any 2D world;
+    # no Pong vocabulary. The reflection itself is a universal kinematic rule
+    # (v -> -e*v along the normal) with a learnable restitution e per surface.
+    # Nothing discontinuous is learned (the rare-event wall); only smooth /
+    # every-frame things are learned (the surface geometry is discovered, e is
+    # a scalar). See WORLD_MODEL_PLAN.md 'Way C / ContactNets'.
+    # ====================================================================
+    SURFACE_STAT_FRAMES = 30   # recent-history window for the stationarity test
+    SURFACE_POS_VAR = 1e-3     # max position variance along the normal axis (~paddle-width scale)
+    SURFACE_GAP = 0.05        # cluster split gap (bigger than a surface, smaller than a roam)
+    SURFACE_MIN_N = 15        # min samples in a cluster to count as a surface
+    def _discover_surfaces(self):
+        """Return a list of (slot, normal_axis, surface_pos, half_extent) for
+        each DISCOVERED surface, by POSITION CLUSTER (slot-churn + shape-label
+        robust). A surface is a plane in space where SOME object sits at a
+        near-constant position along one axis over the recent window. We
+        collect every non-empty slot's (cx, cy) over the recent history, cluster
+        the x-positions and the y-positions, and each tight cluster is a
+        surface plane. Moving objects (the ball -- roams 0..1) never form a
+        tight cluster; stationary-along-an-axis objects (paddles, walls) do.
+        No shape/dim label needed -- pure position stationarity. GENERAL: 'a
+        surface is where something sits still along an axis' -- no Pong vocab.
+        The half_extent is estimated from the cluster's live slot shape (if
+        available) or a small default.
+        """
+        out = []
+        hist = self._corr_hist[-self.SURFACE_STAT_FRAMES:]
+        if len(hist) < 10:
+            return []
+        xs_samples = []   # (cx, slot) for every non-empty slot each frame
+        ys_samples = []
+        for hst in hist:
+            for slot in range(self.MAX_OBJECTS):
+                j = slot * self.STATE_PER_OBJ
+                cx, cy = hst[j], hst[j + 1]
+                if abs(cx) < 1e-6 and abs(cy) < 1e-6:
+                    continue
+                if abs(cx) > 1e-6:
+                    xs_samples.append((cx, slot))
+                if abs(cy) > 1e-6:
+                    ys_samples.append((cy, slot))
+        out += self._cluster_surface_planes(xs_samples, normal_axis=0)
+        out += self._cluster_surface_planes(ys_samples, normal_axis=1)
+        return out
+
+    def _cluster_surface_planes(self, samples, normal_axis):
+        """Group samples by position along the normal axis; a tight cluster
+        (var < SURFACE_POS_VAR) with >= SURFACE_STAT_FRAMES/2 samples is a
+        surface plane. Returns [(live_slot, normal_axis, plane_pos,
+        half_extent), ...]. half_extent from the live slot's shape or a small
+        default."""
+        if len(samples) < 10:
+            return []
+        pos = np.array([s[0] for s in samples])
+        order = np.argsort(pos)
+        pos_s = pos[order]
+        gaps = np.diff(pos_s)
+        split = np.where(gaps > self.SURFACE_GAP)[0]
+        groups = np.split(order, split + 1)
+        out = []
+        for g in groups:
+            if len(g) < self.SURFACE_MIN_N:
+                continue
+            gp = pos[g]
+            if float(np.var(gp)) > self.SURFACE_POS_VAR:
+                continue
+            plane_pos = float(np.median(gp))
+            live_slot = samples[g[-1]][1]
+            sh = self._slot_shape.get(live_slot, (0.02, 0.02))
+            half_extent = 0.5 * (sh[normal_axis] if sh[normal_axis] > 1e-6 else 0.02)
+            out.append((live_slot, normal_axis, plane_pos, half_extent))
+        return out
+
+    def _apply_contact_reflection(self, s_before, s_after, surfaces):
+        """The COMPUTED bounce (ContactNets' complementarity, made simple): if
+        a moving slot CROSSES a discovered surface's plane along the normal,
+        and was moving TOWARD it, reflect that slot's normal-velocity and
+        clamp it to the surface (no penetration). Returns the (possibly
+        reflected) s_after. e (restitution) is per-surface, learned online
+        (defaults to 1.0 = elastic until learned). GENERAL -- a universal
+        kinematic rule, no Pong vocabulary.
+        """
+        if not surfaces:
+            return s_after
+        s = s_after.copy()
+        for (s_slot, axis, spos, half) in surfaces:
+            # the surface plane is STATIONARY along its normal (that's how it
+            # was discovered), so use the discovered plane position `spos`
+            # directly -- not the imagined slot position (the live slot may
+            # churn, and the plane doesn't move along the normal anyway).
+            # (restitution e for this surface -- learned scalar, default 1.0)
+            e = float(self._restitution.get(spos, 1.0))
+            for i in range(self.MAX_OBJECTS):
+                if i == s_slot:
+                    continue
+                # only compact moving objects bounce off surfaces; skip
+                # other surfaces and empty slots. Use the SHAPE aspect (robust
+                # to dim-label noise) -- a near-square (aspect ~1) moving slot.
+                ish = self._slot_shape.get(i)
+                if ish is None:
+                    continue
+                iw, ih = ish
+                if iw < 1e-6 or ih < 1e-6:
+                    continue
+                iasp = iw / ih
+                if not (0.5 < iasp < 2.0):
+                    continue   # elongated -> it's another surface, not a bouncer
+                ij = i * self.STATE_PER_OBJ
+                p_b = s_before[ij + axis]
+                p_a = s_after[ij + axis]
+                v = s[ij + 2 + axis]
+                if abs(v) < 1e-6:
+                    continue
+                # crossed the surface plane (sign flip of (p - spos))?
+                if (p_b - spos) * (p_a - spos) < 0:
+                    # moving toward the surface (v points from before-side to
+                    # the plane)
+                    if ((p_b - spos) > 0 and v < 0) or ((p_b - spos) < 0 and v > 0):
+                        # reflect normal velocity, clamp position to the surface
+                        s[ij + 2 + axis] = -e * v
+                        s[ij + axis] = spos + np.sign(p_b - spos) * (half + 1e-4)
+        return s
+
     def rollout(self, tracks, first_action, action_fn, horizon=20,
-                controlled_id=None, dynamic=True):
+                controlled_id=None, dynamic=True, pure_physics=False):
         """Imagine forward from the current state. Each imagined step =
         physics_default + regime-modulated correction; the regime is carried
         forward in the imagined future (the higher level fires on the imagined
         approach pattern -- this is what makes an imagined bounce sharp).
         All in the agent's head; the servo never moves.
+
+        pure_physics : if True, apply ONLY the physics default + the Way C
+          contact reflection (no learned smooth correction). The physics
+          default is EXACT for free flight (cx += vx); the learned correction
+          can be wrong (corrupted weights) and hurt imagination. This mode
+          tests the principle: imagination = exact kinematics + computed
+          bounces. Diagnostic / a candidate default.
 
         DYNAMIC rollout (the honest version of imagination): STOP as soon as
         the imagination becomes unrealistic, detected by the model's own
@@ -1072,8 +1238,24 @@ class WorldModel:
         hx = self._hx
         stop_reason = None
         t = 0
+        # WAY C: discover surfaces ONCE from the recent real-stream history
+        # (they barely move, so the start-of-rollout snapshot is valid through
+        # the imagined horizon; re-discovering each step is unnecessary).
+        surfaces = self._discover_surfaces()
         for t in range(horizon):
-            s, r, hx, corr_norm = self._predict(s, a, hx=hx)
+            s_before = s
+            if pure_physics:
+                # physics default only (exact free-flight kinematics) +
+                # reward prediction from the net (cheap, doesn't affect state)
+                s = self._physics_default(s)
+                _, r = self._predict(s_before, a)
+                corr_norm = 0.0
+            else:
+                s, r, hx, corr_norm = self._predict(s, a, hx=hx)
+            # WAY C: the COMPUTED bounce -- reflect moving slots that cross a
+            # discovered surface. The discontinuity is generated by a rule, not
+            # learned (the rare-event wall sidestepped).
+            s = self._apply_contact_reflection(s_before, s, surfaces)
             states.append(s.copy())
             rewards.append(float(r))
             if dynamic:
