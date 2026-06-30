@@ -226,6 +226,15 @@ class Track:
     def _predicted(self):
         return self.cx + self.vx, self.cy + self.vy
 
+    def _recent_speed(self):
+        """A robust recent speed (the median |v| over the history) for the
+        physical-plausibility velocity clamp. Median is robust to the spike
+        itself."""
+        if len(self.hist) < 3:
+            return (self.vx ** 2 + self.vy ** 2) ** 0.5
+        speeds = [(h["vx"] ** 2 + h["vy"] ** 2) ** 0.5 for h in self.hist]
+        return float(np.median(speeds))
+
     def update(self, cand, frame, pos_ema=0.85, shape_ema=0.5, action=None):
         # prediction error = distance between this match and where we predicted
         # the object would be. Low for real coasting objects, high for jittery
@@ -265,6 +274,21 @@ class Track:
             self.vy = pos_ema * (ncy - self.cy) + (1 - pos_ema) * self.vy
             self.cx = pos_ema * ncx + (1 - pos_ema) * self.cx
             self.cy = pos_ema * ncy + (1 - pos_ema) * self.cy
+            # PHYSICAL-PLAUSIBILITY CLAMP: a fragment track that snaps from
+            # one blob to another (a perception artifact, not real motion)
+            # would otherwise produce an unphysical velocity spike that hides
+            # the bounce from the world model. Cap |v| at a multiple of the
+            # track's OWN recent (median) speed -- a real object's velocity
+            # doesn't suddenly jump far beyond its recent norm; a fragment
+            # hopping blobs does. The median is robust to the spike itself.
+            # GENERAL -- 'velocity shouldn't discontinuously jump far beyond
+            # this object's recent norm'; no Pong vocabulary.
+            v = (self.vx ** 2 + self.vy ** 2) ** 0.5
+            recent = max(self._recent_speed(), 2.0)
+            vmax = 2.0 * recent
+            if v > vmax and v > 1e-6:
+                self.vx *= vmax / v
+                self.vy *= vmax / v
         # shape: stable (used for cohesion gating + dimensionality cue; jitter
         # here would split/merge tracks spuriously).
         for a in ("w", "h", "area", "aspect", "extent"):
