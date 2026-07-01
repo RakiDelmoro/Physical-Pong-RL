@@ -1308,19 +1308,27 @@ class WorldModel:
 
     def _dedupe_surfaces(self, surfaces):
         """Keep one surface per (axis, plane_pos within SURFACE_GAP). Prefer
-        entries whose slot is a real tracked object (position-clustered) so the
-        finite-surface gate has a shape to work with."""
+        CONSTITUENT surfaces (position-clustered -- an object sits there, so
+        the finite-surface gate has a real slot + shape) over WITNESS surfaces
+        (reflection-event -- nothing sits there, the ball merely bounced). A
+        paddle discovered by BOTH methods keeps its constituent tag (so it
+        still self-skips and can be finite); a wall is only ever a witness.
+        """
         kept = []
         for s in surfaces:
-            s_slot, axis, spos, half = s
-            dup = False
-            for k in kept:
-                _, kaxis, kpos, _ = k
+            s_slot, axis, spos, half, constit = s
+            dup_idx = None
+            for ki, k in enumerate(kept):
+                _, kaxis, kpos, _, kconstit = k
                 if kaxis == axis and abs(kpos - spos) < self.SURFACE_GAP:
-                    dup = True
+                    dup_idx = ki
                     break
-            if not dup:
+            if dup_idx is None:
                 kept.append(s)
+            elif constit and not kept[dup_idx][4]:
+                # a constituent supersedes a witness at the same plane (keep
+                # the better-tagged one)
+                kept[dup_idx] = s
         return kept
 
     def _cluster_surface_planes(self, samples, normal_axis):
@@ -1348,7 +1356,15 @@ class WorldModel:
             live_slot = samples[g[-1]][1]
             sh = self._slot_shape.get(live_slot, (0.02, 0.02))
             half_extent = 0.5 * (sh[normal_axis] if sh[normal_axis] > 1e-6 else 0.02)
-            out.append((live_slot, normal_axis, plane_pos, half_extent))
+            # is_constituent=True: an object SITS at this plane (it
+            # CONSTITUTES the surface -- a paddle). A constituent does NOT
+            # reflect itself off its own plane (nonsense), and it may be FINITE
+            # (a short paddle) -> the finite-surface gate can apply. Distinct
+            # from a reflection-event (witness) surface, is_constituent=False
+            # (see _discover_surfaces_from_reflections): nothing sits there, a
+            # moving object merely WITNESSED a bounce -> the witness DOES
+            # bounce off it, and it's an INFINITE wall (no finite gate).
+            out.append((live_slot, normal_axis, plane_pos, half_extent, True))
         return out
 
     def _discover_surfaces_from_reflections(self):
@@ -1379,29 +1395,37 @@ class WorldModel:
         out = []
         norm = [self.frame_w, self.frame_h]
         for axis in (0, 1):
-            samples = []   # (plane_pos, track_id) at each position turnaround
+            # Only the FASTEST object's bounces reveal walls. A wall reflects
+            # a fast free object (the ball); a paddle's reversals are SERVO
+            # (tracking the ball or hitting its rail) -- it reverses MID-FIELD
+            # wherever the ball went, producing spurious surfaces there
+            # (measured: the opp paddle's y-reversals clustered at 0.69/0.80,
+            # making the imagination bounce the ball mid-field -> garbage).
+            # The separator is MEDIAN step-speed along the axis: the ball moves
+            # EVERY frame at full speed; a paddle idles at its target half the
+            # time, so its median step is lower. Auto-threshold to the max
+            # (within 0.8x): keeps the ball, drops both paddles. GENERAL: 'a
+            # wall is where the fastest-moving object bounces' -- no Pong vocab.
+            med_step = {}
             for tid, h in self._track_pos.items():
                 if len(h) < 2 * self.SURFACE_REFL_WIN + 1:
                     continue
+                pos = np.array([r[1 + axis] for r in h], dtype=np.float64) / norm[axis]
+                med_step[tid] = float(np.median(np.abs(np.diff(pos))))
+            if not med_step:
+                continue
+            max_step = max(med_step.values())
+            if max_step < 1e-3:
+                continue
+            samples = []   # (plane_pos, track_id) at each position turnaround
+            for tid, h in self._track_pos.items():
+                if med_step.get(tid, 0.0) < 0.8 * max_step:
+                    continue   # a slower (servo) track -- not a wall bouncer
                 pos = np.array([r[1 + axis] for r in h], dtype=np.float64) \
                     / norm[axis]   # NORMALIZED (state units)
-                # only MOVING objects turn around at surfaces; skip tracks
-                # that barely move along this axis. Normalized units.
+                # only MOVING objects turn around at surfaces (safety guard).
                 if float(pos.max() - pos.min()) < 0.05:
                     continue
-                # only FREE-MOVING objects (roam in BOTH axes) contribute
-                # turnarounds: a wall reflection reverses a freely moving
-                # object. A PADDLE is stationary along its normal (one axis)
-                # while roaming along the other, so its reversals are TRACKING
-                # (servoing toward the ball), not bounces -- and they land
-                # mid-field (measured: the opp paddle's y-turnarounds scattered
-                # at 0.32/0.58/0.83, producing spurious surfaces that made the
-                # imagination bounce the ball mid-field -> garbage trajectories).
-                # Requiring roam in BOTH axes keeps the ball, drops both paddles.
-                other = np.array([r[1 + (1 - axis)] for r in h], dtype=np.float64) \
-                    / norm[1 - axis]
-                if float(other.max() - other.min()) < 0.05:
-                    continue   # stationary along the other axis -> a paddle
                 for t in range(self.SURFACE_REFL_WIN, len(pos) - self.SURFACE_REFL_WIN):
                     # WINDOWED local extremum: pos[t] is a turnaround if it is
                     # the max (or min) over a ±WIN window AND it stands out by
@@ -1437,7 +1461,7 @@ class WorldModel:
                     continue
                 sh = self._slot_shape.get(bslot, (0.02, 0.02))
                 half = 0.5 * (sh[axis] if sh[axis] > 1e-6 else 0.02)
-                out.append((bslot, axis, plane_pos, half))
+                out.append((bslot, axis, plane_pos, half, False))
         return out
 
     # ==================================================================
@@ -1559,7 +1583,7 @@ class WorldModel:
         if not surfaces:
             return s_after
         s = s_after.copy()
-        for (s_slot, axis, spos, half) in surfaces:
+        for (s_slot, axis, spos, half, is_constituent) in surfaces:
             # the surface plane is STATIONARY along its normal (that's how it
             # was discovered), so use the discovered plane position `spos`
             # directly -- not the imagined slot position (the live slot may
@@ -1590,7 +1614,16 @@ class WorldModel:
             surf_half_t = (0.5 * surf_shape[tangent]
                            if surf_shape and surf_shape[tangent] > 1e-6
                            else 0.5)
-            # The FINITE-SURFACE miss-gate applies ONLY to the surface I
+            # SELF-SKIP only for CONSTITUENT surfaces: a paddle (an object
+            # that SITS at the plane) must not reflect ITSELF off its own
+            # plane (nonsense). A WITNESS surface (a wall discovered from the
+            # ball's own turnaround) is tagged with the ball's slot -- without
+            # this distinction the self-skip would exclude the very object
+            # that should bounce, so the ball flew THROUGH every wall it
+            # discovered (measured: arrival-y error 0.043 with the true velocity
+            # forced in -- the root of the planner tying instead of beating the
+            # reflex). is_constituent cleanly separates the two: a paddle
+            # self-skips, a wall lets its witness bounce off it.
             # CONTROL (the my-paddle): its imagined tangent position is
             # reliable (the action moves it -- that's the lever the planner
             # pulls), and its finiteness is what lets the planner discriminate
@@ -1600,9 +1633,13 @@ class WorldModel:
             # their current imagined y is unreliable and would lose real
             # bounces (it regressed W3b). Robustness-driven, not Pong-specific:
             # we only trust the position of the object we ourselves move.
-            finite = (s_slot == self._controlled_slot and surf_half_t < 0.5)
+            # walls (witness surfaces, is_constituent=False) are INFINITE --
+            # always reflect, no finite gate (nothing sits at a wall whose
+            # tangent position we could read, and a wall spans everything).
+            finite = (is_constituent and s_slot == self._controlled_slot
+                      and surf_half_t < 0.5)
             for i in range(self.MAX_OBJECTS):
-                if i == s_slot:
+                if i == s_slot and is_constituent:
                     continue
                 # only compact moving objects bounce off surfaces; skip
                 # other surfaces and empty slots. Use the SHAPE aspect (robust
@@ -1634,9 +1671,23 @@ class WorldModel:
                         if finite and surf_present \
                                 and gap > (surf_half_t + obj_half_t):
                             continue   # no overlap -> the object flies PAST
-                        # reflect normal velocity, clamp position to the surface
+                        # reflect normal velocity, clamp position to the
+                        # surface. The clamp offset depends on what `spos`
+                        # MEANS for this surface:
+                        #   - CONSTITUENT (a paddle): spos is the paddle's
+                        #     CENTER, so the bouncing object's center clamps
+                        #     to the paddle's EDGE -> offset by the surface's
+                        #     half_extent `half` (paddle half-width).
+                        #   - WITNESS (a wall): spos is the bouncing object's
+                        #     OWN observed CENTER turnaround (we discovered the
+                        #     wall from the ball's cy extremum), so the center
+                        #     clamps to spos DIRECTLY -- an extra `half` offset
+                        #     would push it past the real contact point (it
+                        #     made the imagined bounce 0.030 too high -> the
+                        #     planner tied instead of beating the reflex).
+                        offset = (half + 1e-4) if is_constituent else 1e-4
                         s[ij + 2 + axis] = -v
-                        s[ij + axis] = spos + np.sign(p_b - spos) * (half + 1e-4)
+                        s[ij + axis] = spos + np.sign(p_b - spos) * offset
         return s
 
     def rollout_from_state(self, state, first_action, action_fn, horizon=20,
