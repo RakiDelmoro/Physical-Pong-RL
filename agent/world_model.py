@@ -972,7 +972,71 @@ class WorldModel:
     CONTROLLED_MIN_TRACK = 8   # min frames of a LIVE track's own history
     CONTROLLED_HEIR_RADIUS = 0.25  # normalized: a churned controlled track's
                                    # heir must be within this of its last pos
+    # EXPLORATION gate (when is SIGNED action correlation a trustworthy
+    # DISCOVERY signal vs a confounded one?). The action stream is
+    # EXPLORATORY when I've recently tried BOTH directions (up AND down each
+    # >= CONTROLLED_EXPLORE_MIN times in the last CONTROLLED_EXPLORE_WINDOW
+    # frames) -- i.e. the action is exogenous, not yet driven by the policy.
+    # During exploration the paddle's signed corr cleanly beats the ball's
+    # (measured: 0.47 vs 0.14), so we commit / correct on correlation. Once
+    # the action becomes one-directional (the reflex chasing the ball), the
+    # ball's motion correlates with the action BY CONSTRUCTION (confounded),
+    # so we LOCK to object permanence (hold + heir, no correlation re-commit).
+    # GENERAL: 'discover what I control while I'm still experimenting with
+    # both directions; once I commit to a strategy, just keep track of it.'
+    CONTROLLED_EXPLORE_WINDOW = 60
+    CONTROLLED_EXPLORE_MIN = 5
+    CONTROLLED_SWITCH_MARGIN = 0.12  # while exploring, a challenger track must
+                                     # beat the held track's signed corr by this
+                                     # to take over (corrects a wrong early ball
+                                     # commit -- the ball builds track history
+                                     # fastest and cold-commits first -- without
+                                     # thrashing on a noisy near-tie)
+    # LAG-AWARE action<->motion fit. The paddle's EMA-smoothed position LAGS
+    # the action (~6 frames), so the per-frame delta pos[t+1]-pos[t] is a
+    # SMEARED echo of the action and its k=1 correlation is only ~0.33
+    # (barely above the ball's spurious ~0.29 -> the controlled-object
+    # detector couldn't tell the paddle from the ball). A LONGER window delta
+    # pos[t+k]-pos[t] ~ gain * sum(action over the window) absorbs the lag
+    # (the EMA catches up over a window >> its time constant) and raises the
+    # SNR. We take the best (axis, window) pair. Windows span 1 (per-frame)
+    # up to CONTROLLED_FIT_MAXLAG; each needs CONTROLLED_FIT_MINPAIRS pairs.
+    CONTROLLED_FIT_MAXLAG = 12
+    CONTROLLED_FIT_MINPAIRS = 8
     CORR_HIST = 80             # length of the dedicated correlation history
+
+    def _action_scalar(self, a):
+        """Map an action INDEX to its signed scalar: the NON-NEUTRAL actions
+        split into two OPPOSING halves (first half +1, second half -1), the
+        neutral action is 0. GENERAL for paired-direction control: e.g. a 1D
+        paddle's actions [up, down, stay] -> [+1, -1, 0]. The previous
+        `a < neutral -> +1` rule was WRONG for this encoding: it mapped BOTH
+        up(0) and down(1) to +1 (both are < neutral=2), collapsing the two
+        opposite directions into one and garbling the signed correlation,
+        the gain sign, and the exploration gate. Which physical direction is
+        '+' is then DISCOVERED from the action<->motion correlation's sign
+        (see _controlled_action_model / Policy._action_sign)."""
+        a = int(a)
+        neutral = self.num_actions - 1
+        if a == neutral:
+            return 0.0
+        non_neutral = [i for i in range(self.num_actions) if i != neutral]
+        half = len(non_neutral) // 2
+        idx = non_neutral.index(a)
+        return +1.0 if idx < half else -1.0
+
+    def _is_exploring(self):
+        """Is the recent action stream EXPLORATORY (both opposing directions
+        tried recently) vs committed to a strategy (one-directional)? See
+        CONTROLLED_EXPLORE_WINDOW / _MIN. Uses _action_scalar so the two
+        directions are the two OPPOSITE signs (not both '+')."""
+        win = self._acts_full[-self.CONTROLLED_EXPLORE_WINDOW:]
+        if len(win) < self.CONTROLLED_EXPLORE_WINDOW:
+            return True   # not enough history yet -> treat as exploring (cold)
+        n_pos = sum(1 for a in win if self._action_scalar(a) > 0)
+        n_neg = sum(1 for a in win if self._action_scalar(a) < 0)
+        return n_pos >= self.CONTROLLED_EXPLORE_MIN \
+            and n_neg >= self.CONTROLLED_EXPLORE_MIN
 
     def controlled_track(self, tracks):
         """Discover the controlled object from the world model's OWN history:
@@ -1003,11 +1067,6 @@ class WorldModel:
         """
         if self.n_obs < self.CONTROLLED_WARMUP:
             return None   # cold -- not enough history for a correlation
-        neutral = self.num_actions - 1
-        def scalar(a):
-            a = int(a)
-            if a == neutral: return 0.0
-            return +1.0 if a < neutral else -1.0
         # PER-TRACK-ID correlation (churn-free). The old per-SLOT query broke
         # because the paddle's SLOT reassigns whenever its track dies at a
         # ball-contact (the kind-gate makes the paddle REJECT the merged blob
@@ -1036,45 +1095,54 @@ class WorldModel:
             h = self._track_pos.get(tid)
             if h is None or len(h) < self.CONTROLLED_MIN_TRACK:
                 continue
-            pos_x = np.array([r[1] for r in h], dtype=np.float64)
-            pos_y = np.array([r[2] for r in h], dtype=np.float64)
-            sc = np.array([scalar(r[0]) for r in h], dtype=np.float64)
-            c_track = 0.0
-            for pos in (pos_x, pos_y):
-                d = np.diff(pos)            # delta[t] = pos[t+1]-pos[t]
-                a = sc[1:]                   # the action that drove each delta
-                d = d - d.mean(); a = a - a.mean()
-                vd = float(np.sqrt((d ** 2).sum()))
-                va = float(np.sqrt((a ** 2).sum()))
-                if vd < 1e-9 or va < 1e-9:
-                    continue
-                corr = abs(float((d * a).sum() / (vd * va)))
-                c_track = max(c_track, corr)
+            c_track, _, _ = self._fit_action_motion(h)
             tid_corr[tid] = c_track
             if c_track > best_corr:
                 best_corr, best_tid = c_track, tid
         if best_tid is None and self._controlled_track_id is None:
             return None   # cold and nothing reacts enough to newly commit
-        # ---- OBJECT-PERMANENCE HIERARCHY (the controlled object is
-        # persistent; carry its identity through churn and quiet periods) ----
+        # ---- DECISION: DISCOVER while exploring, then LOCK by object
+        # permanence. The controlled object is found by SIGNED action
+        # correlation (the paddle moves CONSISTENTLY in the action's
+        # direction -> high abs(signed) corr; the ball deflects variably ->
+        # low). But two confounds force a two-phase design:
+        #   (a) the BALL builds track history fastest (always visible) so it
+        #     cold-commits FIRST; a wrong early commit must be CORRECTABLE by
+        #     a clearly-better challenger (the paddle, once its track lives
+        #     long enough to show its strong signed corr).
+        #   (b) once the REFLEX takes over, the ACTION FOLLOWS THE BALL (move
+        #     toward it) -> the ball's motion correlates with the action BY
+        #     CONSTRUCTION, so correlation is no longer trustworthy.
+        # So: while EXPLORING (recent actions tried both directions) we
+        # commit/switch on correlation; once the action becomes a committed
+        # strategy we LOCK -- hold the committed track while live, and on
+        # churn re-recognize the heir by position + shape (object permanence,
+        # no correlation). GENERAL: 'discover what I control while I'm still
+        # experimenting; once I commit to a strategy, just keep track of it.'
         held = self._controlled_track_id
+        exploring = self._is_exploring()
         chosen = None
         if held is not None and held in live_tids:
-            # (1) HOLD: the committed track is still live -> keep it. Its
-            # action-correlation NATURALLY drops during quiet (mostly-stay)
-            # periods -- that is NOT evidence the controlled object changed,
-            # so we do NOT release on low corr (the old gate did, and lost
-            # the commit the moment the reflex settled into mostly-stay).
-            chosen = held
+            # HOLD (with optional challenger switch while exploring).
+            if exploring:
+                held_corr = tid_corr.get(held, 0.0)
+                if best_tid is not None and best_tid != held \
+                        and best_corr > held_corr + self.CONTROLLED_SWITCH_MARGIN:
+                    chosen = best_tid      # the paddle takes over from the ball
+                else:
+                    chosen = held
+            else:
+                chosen = held              # LOCKED: hold while live
         elif held is not None and self._controlled_last_pos is not None:
-            # (2) HEIR (churn bridge): the committed track DIED (e.g. the
-            # paddle's track coasts out at a ball-contact and restarts with a
-            # new id). The controlled object does NOT teleport and its shape
-            # class persists, so the heir is the live track of the SAME shape
-            # class nearest to the last known position. This re-recognizes the
-            # new paddle track WITHOUT needing action variation (which quiet
-            # periods don't provide). GENERAL: object permanence + kind
-            # constancy -- no Pong vocabulary.
+            # HEIR (both phases): the committed track DIED (e.g. the paddle's
+            # track coasts out at a ball-contact and restarts with a new id).
+            # The controlled object does not teleport and its shape class
+            # persists, so the heir is the live track of the SAME shape class
+            # nearest to the last known position (normalized distance). This
+            # re-recognizes the new paddle track WITHOUT needing action
+            # variation (which a committed strategy doesn't provide) and
+            # WITHOUT confounded correlation. If no heir is visible yet, WAIT
+            # (return None) -- while exploring we may instead cold-commit.
             hx, hy = self._controlled_last_pos
             hw, hh = self._controlled_shape or (0.0, 0.0)
             h_asp = (hw / hh) if hh > 1e-6 else 1.0
@@ -1088,21 +1156,23 @@ class WorldModel:
                 t_elong = not (0.5 <= t_asp <= 2.0)
                 if t_elong != h_elong:
                     continue   # different shape class -> not the heir
-                dx = t.get("cx", 0.0) - hx
-                dy = t.get("cy", 0.0) - hy
+                dx = (t.get("cx", 0.0) - hx) / self.frame_w
+                dy = (t.get("cy", 0.0) - hy) / self.frame_h
                 d2 = dx * dx + dy * dy
                 if best_d2 is None or d2 < best_d2:
                     best_d2, heir = d2, t["id"]
             if heir is not None and best_d2 is not None \
                     and best_d2 < (self.CONTROLLED_HEIR_RADIUS ** 2):
                 chosen = heir
-            else:
-                # no positional heir -> newly commit via correlation if able
-                if best_tid is not None and best_corr >= self.CONTROLLED_CORR_GATE:
-                    chosen = best_tid
+            elif exploring and best_tid is not None \
+                    and best_corr >= self.CONTROLLED_CORR_GATE:
+                chosen = best_tid   # exploration fallback: no heir yet -> commit
         else:
-            # (3) COLD COMMIT: no held track -> newly commit on correlation
-            if best_tid is not None and best_corr >= self.CONTROLLED_CORR_GATE:
+            # COLD COMMIT (no held track): commit on correlation while
+            # exploring; once locked with no commit, stay None (can't discover
+            # under a confounded action stream -- wait for exploration).
+            if exploring and best_tid is not None \
+                    and best_corr >= self.CONTROLLED_CORR_GATE:
                 chosen = best_tid
         if chosen is None:
             return None
@@ -1242,55 +1312,79 @@ class WorldModel:
     # from the action/position-delta correlation history (the SAME history
     # controlled_track uses), no Pong vocabulary.
     # ==================================================================
+    def _fit_action_motion(self, triples):
+        """LAG-AWARE fit of an object's motion to the action, from a list of
+        (action, cx_px, cy_px) triples (track-id-stable, so no slot churn).
+        Returns (best_corr, best_axis, best_gain_px_per_frame) -- the (axis,
+        window) pair whose displacement best tracks the cumulative action.
+
+        The paddle's EMA-smoothed position LAGS the action, so the per-frame
+        delta (window k=1) is a smeared echo and under-reads both the
+        correlation AND the gain. A window-k delta pos[t+k]-pos[t] is driven
+        by the CUMULATIVE action sum(sc[t..t+k-1]) over those k frames; over a
+        window >> the EMA time constant the position catches up, so the
+        regression recovers the true per-frame gain and a near-unity
+        correlation. We pick the (axis, window) with the largest |corr| over
+        windows {1, 6, 12} (each needing >= CONTROLLED_FIT_MINPAIRS pairs).
+        GENERAL: 'the object I control moves, after some response delay, by
+        the amount my action accumulated' -- no Pong vocabulary.
+        """
+        neutral = self.num_actions - 1
+        n = len(triples)
+        if n < 4:
+            return 0.0, None, 0.0
+        pos_x = np.array([r[1] for r in triples], dtype=np.float64)
+        pos_y = np.array([r[2] for r in triples], dtype=np.float64)
+        sc = np.array([self._action_scalar(r[0]) for r in triples], dtype=np.float64)
+        cs = np.concatenate([[0.0], np.cumsum(sc)])   # cs[i] = sum(sc[:i])
+        windows = [k for k in (1, 6, self.CONTROLLED_FIT_MAXLAG)
+                   if k >= 1 and n - k >= self.CONTROLLED_FIT_MINPAIRS]
+        if not windows:
+            windows = [1]
+        best_corr, best_axis, best_gain = 0.0, None, 0.0
+        for axis, pos in ((0, pos_x), (1, pos_y)):
+            for k in windows:
+                m = n - k
+                if m < self.CONTROLLED_FIT_MINPAIRS:
+                    continue
+                delta = pos[k:] - pos[:m]                 # pos[t+k]-pos[t]
+                cumact = cs[k:n] - cs[:m]                   # sum(sc[t..t+k-1])
+                d = delta - delta.mean()
+                a = cumact - cumact.mean()
+                vd = float(np.sqrt((d ** 2).sum()))
+                va = float(np.sqrt((a ** 2).sum()))
+                if vd < 1e-9 or va < 1e-9:
+                    continue
+                corr = abs(float((d * a).sum() / (vd * va)))
+                if corr > best_corr:
+                    # gain: delta_k ~ gain * cumact  ->  gain = <d,a>/<a,a>
+                    # (per-frame px per action unit; the k-window normalizes
+                    # itself because cumact already sums the k actions).
+                    denom = float((a ** 2).sum())
+                    gain = float((d * a).sum() / denom) if denom > 1e-12 else 0.0
+                    best_corr, best_axis, best_gain = corr, axis, gain
+        return best_corr, best_axis, best_gain
+
     def _controlled_action_model(self):
         """Return (axis, gain_per_action_scalar, neutral) for the controlled
-        object, or None -- discovered from the controlled TRACK's perception
-        velocity vs the action (clean: the track id has stable identity, so
-        no slot-churn contamination). `axis` is 0 (x) or 1 (y); `gain` is the
-        per-frame velocity per unit of the signed action scalar (the action's
-        effect on the controlled object's motion), in normalized units.
-        GENERAL: 'the object I control moves at the rate my action has
+        object, or None -- the LAG-AWARE fit of the controlled track's motion
+        to the action (see _fit_action_motion). `axis` is 0 (x) or 1 (y);
+        `gain` is the per-frame velocity per unit of the signed action scalar
+        (the action's effect on the controlled object's motion), in normalized
+        units. GENERAL: 'the object I control moves at the rate my action has
         empirically moved it.'"""
         if self._controlled_slot is None or self.n_obs < 200:
             return None
-        hist = self._ctrl_track_vel   # list of (action, vx, vy) for the ctrl track
+        hist = self._ctrl_track_vel   # (action, cx, cy, vx, vy) for the ctrl track
         if len(hist) < 60:
             return None
-        neutral = self.num_actions - 1
-        def scalar(a):
-            a = int(a)
-            if a == neutral: return 0.0
-            return +1.0 if a < neutral else -1.0
-        sc_all = np.array([scalar(h[0]) for h in hist], dtype=np.float64)
-        if float(np.sqrt(((sc_all - sc_all.mean()) ** 2).sum())) < 1e-9:
-            return None   # no action variation -> can't fit a slope
-        best_axis, best_gain = None, 0.0
-        for axis in (0, 1):
-            # Regress the per-frame POSITION DELTA on the action scalar -- NOT
-            # the reported velocity (an EMA that LAGS and underestimates the
-            # true displacement; that made the imagined paddle ~5x too slow,
-            # so the planner's intercept predictions were systematically
-            # wrong). delta[t]=pos[t+1]-pos[t] is caused by action[t+1], so
-            # align delta with sc_all[1:]. Track-id stable -> no slot churn.
-            pos = np.array([h[1 + axis] for h in hist], dtype=np.float64)
-            d = np.diff(pos)                 # px displacement per frame
-            a = sc_all[1:]                    # the action that drove each delta
-            d = d - d.mean()
-            a0 = a - a.mean()
-            vv = float(np.sqrt((d ** 2).sum()))
-            if vv < 1e-9:
-                continue
-            denom = float((a0 ** 2).sum())
-            if denom < 1e-12:
-                continue
-            gain = float((d * a0).sum() / denom)
-            if abs(gain) > abs(best_gain):
-                best_gain, best_axis = gain, axis
-        if best_axis is None or abs(best_gain) < 1e-3:
+        triples = [(h[0], h[1], h[2]) for h in hist]
+        corr, axis, gain_px = self._fit_action_motion(triples)
+        if axis is None or abs(gain_px) < 1e-3:
             return None
-        # gain is px/frame; normalize to the state's normalized units
-        norm = self.frame_h if best_axis == 1 else self.frame_w
-        return (best_axis, best_gain / norm, neutral)
+        neutral = self.num_actions - 1
+        norm = self.frame_h if axis == 1 else self.frame_w
+        return (axis, gain_px / norm, neutral)
 
     def _apply_action_effect(self, s, action, action_model):
         """In the imagination, the controlled object moves under the imagined
@@ -1302,7 +1396,7 @@ class WorldModel:
             return s
         axis, gain, neutral = action_model
         a = int(action)
-        scalar = 0.0 if a == neutral else (+1.0 if a < neutral else -1.0)
+        scalar = self._action_scalar(a)
         # override the controlled slot's position advance along `axis` with
         # the action's effect (the physics default already advanced it by its
         # velocity; we ADD the action's delta on top -- a real paddle moves
