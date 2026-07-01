@@ -77,6 +77,17 @@ class Policy:
     TRUST_WINDOW = 80       # the recent-points window we compare over
     TRUST_MARGIN = 0.3      # residual must beat prior by this opponent-points/
                             # frame in the window to take control
+    # EXPLORE FRACTION (breaks the trust-gate chicken-and-egg). The old gate
+    # never let the planner act until it was trusted, but couldn't trust it
+    # until it had acted -> n_plan stayed 0 -> never promoted. So while
+    # UNTRUSTED, let the planner act on a FRACTION of frames (exploration) to
+    # gather evidence, and use the safe prior the rest (safety). Those
+    # explored frames' outcomes populate _plan_bad; once the planner's
+    # opponent-points-per-frame beats the prior's by TRUST_MARGIN, the gate
+    # promotes and the planner takes over fully. Classic explore/exploit in a
+    # trust gate. GENERAL: 'let an unproven strategy try sometimes so you can
+    # measure it, but mostly play safe.'
+    TRUST_EXPLORE_FRAC = 0.5
 
     def __init__(self, world_model, num_actions=3, neutral=None):
         self.wm = world_model
@@ -88,6 +99,10 @@ class Policy:
         self._plan_bad = []
         self._trusted = False
         self._frame = 0
+        # RNG for the explore fraction (which frames the planner tries on
+        # while untrusted). Unseeded -> robust to *which* frames; the gate
+        # compares rates over a window, not specific frames.
+        self._rng = np.random.default_rng()
         # the last decision's provenance, for observe() to credit correctly
         self._last_was_planner = False
 
@@ -226,8 +241,15 @@ class Policy:
             chosen = self._planner_action(state, controlled_id)
             self._last_was_planner = (chosen != prior_a)
         else:
-            chosen = prior_a
-            self._last_was_planner = False
+            # UNTRUSTED: explore on a fraction of frames (let the planner act
+            # so the gate can measure it), else play safe with the prior.
+            explore = float(self._rng.random()) < self.TRUST_EXPLORE_FRAC
+            if explore:
+                chosen = self._planner_action(state, controlled_id)
+                self._last_was_planner = (chosen != prior_a)
+            else:
+                chosen = prior_a
+                self._last_was_planner = False
         self._frame += 1
         return int(chosen)
 
