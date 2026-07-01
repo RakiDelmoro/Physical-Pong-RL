@@ -1454,7 +1454,24 @@ class WorldModel:
                 gp = poss[g]
                 if float(np.var(gp)) > self.SURFACE_REFL_POS_VAR:
                     continue
-                plane_pos = float(np.median(gp))
+                # The wall is the EDGE of observed motion, not its center.
+                # The position EMA LAGS, so each observed turnaround is rounded
+                # INWARD (toward the field, where the object came from) -- the
+                # true wall is always slightly FURTHER OUT than the turnaround.
+                # The cluster MEDIAN accumulates that inward bias (measured:
+                # wall at 0.869 vs true 0.8625, err 0.009 -> arrival err 0.044,
+                # 5x amplification). The cluster EXTREMUM -- the turnaround
+                # furthest from the field center (0.5) -- is the least-lagged,
+                # closest to the true boundary. GENERAL: 'a wall is the edge of
+                # all observed positions, and smoothing only rounds inward, so
+                # the tightest boundary is the extremum, not the average.' No
+                # Pong constant (no hardcoded 0.8625); just the field center as
+                # the 'inside' reference.
+                center = 0.5
+                if float(np.mean(gp)) > center:
+                    plane_pos = float(np.max(gp))   # a far (top/bottom) wall
+                else:
+                    plane_pos = float(np.min(gp))   # a near wall
                 btid = samples[g[-1]][1]
                 bslot = self._slot_map.get(btid)
                 if bslot is None:
