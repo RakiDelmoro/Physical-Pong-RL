@@ -49,6 +49,19 @@ class Policy:
 
     # ---- planner config ----
     HORIZON = 25            # imagined frames ahead per candidate action
+    # ACTION COMMIT WINDOW (MPC semantics): the candidate action is held
+    # fixed for the WHOLE imagined horizon -- 'what happens if I KEEP doing
+    # this?' The planner picks the sustained action whose imagined future is
+    # safest, executes it for ONE real step, then re-plans next frame. This
+    # is what lets the planner DISCRIMINATE: if the reflex takes over mid-
+    # rollout, every candidate converges to the SAME (reflex) trajectory and
+    # the action's effect washes out -- measured directly, commit=4 gave 0
+    # discriminating frames; commit=HORIZON gave 10/90. A short commit only
+    # sees the action's one-frame twitch before the reflex coasts; the full
+    # commit sees a sustained strategy. (The reflex is still the fallback
+    # DECIDER when the planner is untrusted; this is only the imagined
+    # rollout's inner assumption.)
+    COMMIT_WINDOW = HORIZON
     # The imagined RETURN discounts later frames UP (gamma > 1): the action
     # barely affects the early imagined frames (the ball is far from my
     # paddle) and only matters when the ball reaches my plane near the end of
@@ -122,35 +135,67 @@ class Policy:
     # ==================================================================
     # THE PLANNER -- imagine each action, pick the best imagined future
     # ==================================================================
+    # The planner discriminates actions by a DIRECT state signal, not the
+    # predicted reward scalar. The reward predictor was trained on one-step
+    # REAL transitions; over a long IMAGINED rollout it is off-distribution
+    # and noisy, so summing it gave a wobbly score and the planner picked
+    # wrong. Instead: read the imagined movie directly -- 'how close did the
+    # ball get to my wall?' Higher = safer (if my paddle intercepted, the Way
+    # C reflection bounced it back, so min-x stays at my paddle plane; if it
+    # got past me, min-x -> 0). GENERAL: 'the action is good if the imagined
+    # future keeps the threat furthest from my goal line' -- no reward
+    # predictor, no Pong vocab.
+    SAFETY_MARGIN = 0.01   # only diverge from the prior if meaningfully safer
+
     def _imagined_return(self, state, first_action, controlled_id):
         """Roll out the imagined future under `first_action` (then the safe
-        prior for subsequent imagined steps), sum the predicted reward with a
-        RECENCY UP-WEIGHT (RETURN_GAMMA) so the action-dependent part (late
-        in the horizon, when the ball reaches my plane) is not drowned by the
-        action-independent base rate (early frames). Returns the total."""
+        prior for subsequent imagined steps) and return a SAFETY score: the
+        MINIMUM ball-x reached over the horizon (higher = the ball stayed
+        further from my wall = safer). The ball = the fast free slot at the
+        rollout's start (slot identity is stable through the rollout -- pure
+        kinematics, no reassignment). If the ball isn't in the state, return
+        a neutral 0.0 so the prior wins the tie (no opinion)."""
+        controlled = self.wm._controlled_slot
+        ball_slot = self._ball_slot(state, controlled)
+        if ball_slot is None:
+            return 0.0   # no ball in the state -> no opinion, prior wins
+        # COMMIT the candidate action for the first COMMIT_WINDOW imagined
+        # steps (a sustained strategy), THEN let the safe prior take over.
+        # action_fn(s, t) chooses the action for step t+1 (step 0 already used
+        # `first_action`), so we hold the candidate while t+1 < COMMIT_WINDOW.
+        candidate = int(first_action)
+        commit = int(self.COMMIT_WINDOW)
         def action_fn(s, t):
+            if t + 1 < commit:
+                return candidate
             return self._safe_prior(s, self.wm._controlled_slot,
                                     self._ball_slot(s, self.wm._controlled_slot))
-        states, rewards, _, _ = self.wm.rollout_from_state(
+        states, _, _, _ = self.wm.rollout_from_state(
             state, first_action=first_action, action_fn=action_fn,
             horizon=self.HORIZON, controlled_id=controlled_id)
-        w = 1.0
-        total = 0.0
-        for r in rewards:
-            total += w * float(r)
-            w *= self.RETURN_GAMMA
-        return total
+        bj = ball_slot * self.wm.STATE_PER_OBJ
+        # the closest the ball got to my wall (x=0) over the imagined future;
+        # higher = safer. Track the ball slot's x (slot identity is stable
+        # through the rollout).
+        return min(float(s[bj]) for s in states)
 
     def _planner_action(self, state, controlled_id):
-        """Pick the action with the best imagined total reward. Ties break
-        toward the safe prior's action (the planner is conservative)."""
+        """Pick the action with the best (highest) imagined SAFETY score. The
+        SAFE PRIOR's own imagined score is the BAR TO BEAT -- a candidate
+        action only takes over if it is MEANINGFULLY safer (by SAFETY_MARGIN).
+        Ties and near-ties keep the prior (the planner is conservative; this
+        stops it thrashing to an arbitrary action when the imagination can't
+        discriminate -- e.g. the ball is not threatening this horizon)."""
         prior_a = self._safe_prior(
             state, self.wm._controlled_slot,
             self._ball_slot(state, self.wm._controlled_slot))
-        best_a, best_r = prior_a, None
+        best_a = prior_a
+        best_r = self._imagined_return(state, prior_a, controlled_id)
         for a in range(self.num_actions):
+            if a == prior_a:
+                continue
             r = self._imagined_return(state, a, controlled_id)
-            if best_r is None or r > best_r + 1e-6:
+            if r > best_r + self.SAFETY_MARGIN:
                 best_r, best_a = r, a
         return best_a
 

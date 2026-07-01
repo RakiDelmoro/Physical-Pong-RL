@@ -397,10 +397,31 @@ class WorldModel:
         # slope; the full history guarantees enough action variation).
         self._state_hist_full = []
         self._acts_full = []
-        # the controlled track's perception velocity history, for the
-        # action->motion model (clean: track-id identity is stable). List of
-        # (action, vx_px, vy_px) for the controlled track each frame.
+        # the controlled track's history, for the action->motion model
+        # (clean: track-id identity is stable). List of (action, cx_px,
+        # cy_px, vx_px, vy_px) for the controlled track each frame. POSITION
+        # is what we regress on (its per-frame DELTA = the true displacement
+        # under linear motion, even though the reported velocity is an EMA
+        # that LAGS and underestimates -- that underestimate made the imagined
+        # paddle ~5x too slow, so the planner's intercept predictions were
+        # wrong. Position-deltas fix it.).
         self._ctrl_track_vel = []
+        # PER-TRACK-ID position history for the controlled-object discovery
+        # query. Keyed by TRACK ID (stable identity within a track's life),
+        # NOT by slot (which churns -- the paddle's slot reassigns as its
+        # track dies at ball-contacts and restarts). Each value is a list of
+        # (action, cx_px, cy_px) capped at CORR_HIST. The controlled object
+        # is the track whose POSITION DELTA correlates with the action --
+        # measured on the track's own stable identity, so it survives slot
+        # churn and even track-id churn (each active paddle track accumulates
+        # its own correlation; we return whichever is best RIGHT NOW).
+        self._track_pos = {}
+        self._controlled_track_id = None   # hysteresis on the TRACK ID
+        self._controlled_last_pos = None  # (cx, cy) px of the controlled
+                                          # track's last LIVE position (for
+                                          # object-permanence bridging)
+        self._controlled_shape = None     # (w, h) of the controlled track
+                                          # (heir must match its shape class)
                                 # object correlation query; see controlled_track)
         # a SEPARATE, longer history for the controlled-object correlation
         # query (the DPC higher level's _state_hist is only HIST_LEN=8, too
@@ -669,7 +690,9 @@ class WorldModel:
             for t in tracks:
                 if t["id"] == controlled_id:
                     self._ctrl_track_vel.append(
-                        (int(action), float(t.get("vx", 0.0)),
+                        (int(action), float(t.get("cx", 0.0)),
+                         float(t.get("cy", 0.0)),
+                         float(t.get("vx", 0.0)),
                          float(t.get("vy", 0.0))))
                     if len(self._ctrl_track_vel) > 300:
                         self._ctrl_track_vel.pop(0)
@@ -696,6 +719,23 @@ class WorldModel:
             self._corr_hist.pop(0)
         if len(self._corr_acts) > self.CORR_HIST:
             self._corr_acts.pop(0)
+        # PER-TRACK-ID position history (churn-free controlled discovery).
+        # Record every visible track's (action, cx, cy); prune tracks no
+        # longer present once they're too short to ever clear the gate.
+        live_tids = set()
+        for t in tracks:
+            tid = t["id"]
+            live_tids.add(tid)
+            self._track_pos.setdefault(tid, []).append(
+                (int(action), float(t.get("cx", 0.0)), float(t.get("cy", 0.0))))
+            if len(self._track_pos[tid]) > self.CORR_HIST:
+                self._track_pos[tid].pop(0)
+        # drop dead tracks with too little history to be useful (keep short
+        # recent ones in case they recur; cap the dict size).
+        if len(self._track_pos) > 64:
+            self._track_pos = {
+                tid: h for tid, h in self._track_pos.items()
+                if tid in live_tids or len(h) >= 30}
         if self._last_state is not None and self._last_action is not None:
             default_next = self._physics_default(self._last_state)
             residual = cur_state - default_next
@@ -929,6 +969,9 @@ class WorldModel:
     CONTROLLED_CORR_GATE = 0.05  # min |corr| to NEWLY call a slot controlled
     CONTROLLED_HOLD_GATE = 0.02  # below this, an existing controlled slot is
                                  # dropped (hysteresis: commit high, hold low)
+    CONTROLLED_MIN_TRACK = 8   # min frames of a LIVE track's own history
+    CONTROLLED_HEIR_RADIUS = 0.25  # normalized: a churned controlled track's
+                                   # heir must be within this of its last pos
     CORR_HIST = 80             # length of the dedicated correlation history
 
     def controlled_track(self, tracks):
@@ -960,67 +1003,124 @@ class WorldModel:
         """
         if self.n_obs < self.CONTROLLED_WARMUP:
             return None   # cold -- not enough history for a correlation
-        hist = self._corr_hist
-        acts = self._corr_acts
-        n = len(hist)
-        if n < 30 or len(acts) < n:
-            return None
-        # the action signal: UP=+1, DOWN=-1, STAY=0 (the signed scalar that
-        # actually drives the paddle). Stated in discovered terms -- we use the
-        # action's signed effect, not a hardcoded 'paddle index'.
-        act_signed = np.array(acts[:-1], dtype=np.float64)   # aligned with deltas
-        act_signed = act_signed - act_signed.mean()
-        denom = float(np.sqrt((act_signed ** 2).sum()))
-        if denom < 1e-9:
-            return None   # no action variation in the window -> can't tell
-        # per slot: correlate the slot's POSITION DELTA (frame-to-frame change)
-        # with the action. Delta is cleaner than the stored vy (which is an
-        # EMA that decays during STAY frames and lags). The controlled slot's
-        # delta tracks the action; passive slots' deltas don't. We take the
-        # max over both cx and vy correlation to stay general ('the position
-        # component that tracks the action').
-        # per-slot correlation with the action (max over cx/cy deltas).
-        slot_corr = np.zeros(self.MAX_OBJECTS)
-        best_slot, best_corr = None, 0.0
-        for slot in range(self.MAX_OBJECTS):
-            j = slot * self.STATE_PER_OBJ
-            dxs = np.array([hist[i + 1][j] - hist[i][j] for i in range(n - 1)])
-            dys = np.array([hist[i + 1][j + 1] - hist[i][j + 1]
-                            for i in range(n - 1)])
-            c_slot = 0.0
-            for d in (dxs, dys):
-                d = d - d.mean()
+        neutral = self.num_actions - 1
+        def scalar(a):
+            a = int(a)
+            if a == neutral: return 0.0
+            return +1.0 if a < neutral else -1.0
+        # PER-TRACK-ID correlation (churn-free). The old per-SLOT query broke
+        # because the paddle's SLOT reassigns whenever its track dies at a
+        # ball-contact (the kind-gate makes the paddle REJECT the merged blob
+        # -> it coasts -> dies after MAX_MISS -> restarts with a new track id
+        # -> a new slot), so no single slot ever accumulated a clean paddle
+        # signal and the fast, always-present BALL won the correlation
+        # spuriously -- making the 'reflex' control the ball / nothing (it
+        # leaked 5-8 points; the real reflex on the paddle leaks 0). Keying by
+        # TRACK ID fixes it: each active paddle track accumulates its OWN
+        # correlation on its stable identity; we return whichever is best NOW,
+        # so track-id churn just hands off between paddle tracks instead of
+        # losing the signal. GENERAL: 'the object I control is the one whose
+        # motion follows my action' -- measured per persistent identity.
+        live_tids = {t["id"] for t in tracks}
+        best_tid, best_corr = None, 0.0
+        tid_corr = {}
+        # Only consider LIVE tracks (currently visible) -- returning a dead
+        # track id is useless (the policy can't place it in the state) and
+        # was happening when a dead paddle track's stale high corr won. A
+        # freshly-churned paddle track (just restarted after a contact) has
+        # little history, so the per-track minimum is LOW -- the paddle's
+        # motion follows the action so clearly (it moves on +/-1 actions,
+        # holds on stay) that even ~8 frames discriminate it from the ball,
+        # whose motion is independent of the action.
+        for tid in live_tids:
+            h = self._track_pos.get(tid)
+            if h is None or len(h) < self.CONTROLLED_MIN_TRACK:
+                continue
+            pos_x = np.array([r[1] for r in h], dtype=np.float64)
+            pos_y = np.array([r[2] for r in h], dtype=np.float64)
+            sc = np.array([scalar(r[0]) for r in h], dtype=np.float64)
+            c_track = 0.0
+            for pos in (pos_x, pos_y):
+                d = np.diff(pos)            # delta[t] = pos[t+1]-pos[t]
+                a = sc[1:]                   # the action that drove each delta
+                d = d - d.mean(); a = a - a.mean()
                 vd = float(np.sqrt((d ** 2).sum()))
-                if vd < 1e-9:
+                va = float(np.sqrt((a ** 2).sum()))
+                if vd < 1e-9 or va < 1e-9:
                     continue
-                corr = abs(float((d * act_signed).sum() / (vd * denom)))
-                c_slot = max(c_slot, corr)
-            slot_corr[slot] = c_slot
-            if c_slot > best_corr:
-                best_corr, best_slot = c_slot, slot
-        if best_slot is None:
-            return None
-        # HYSTERESIS (commit-and-hold): the controlled object is a PERSISTENT
-        # property (the paddle I control does not change frame to frame), so
-        # once a controlled slot is set we HOLD it unless its correlation
-        # drops below a LOWER threshold. This stops the per-frame flips (a
-        # noisy 80-frame correlation window oscillates ~77% correct without
-        # this) that corrupted the slot assignment and hurt W2/Horde. NOT the
-        # old heuristic tower -- a single commit/hold rule with two thresholds.
-        if self._controlled_slot is not None:
-            held_corr = slot_corr[self._controlled_slot]
-            if held_corr >= self.CONTROLLED_HOLD_GATE:
-                best_slot = self._controlled_slot   # hold the committed slot
-            # else: the committed slot's correlation collapsed -> switch to the
-            # new best (which already cleared best_corr by definition)
+                corr = abs(float((d * a).sum() / (vd * va)))
+                c_track = max(c_track, corr)
+            tid_corr[tid] = c_track
+            if c_track > best_corr:
+                best_corr, best_tid = c_track, tid
+        if best_tid is None and self._controlled_track_id is None:
+            return None   # cold and nothing reacts enough to newly commit
+        # ---- OBJECT-PERMANENCE HIERARCHY (the controlled object is
+        # persistent; carry its identity through churn and quiet periods) ----
+        held = self._controlled_track_id
+        chosen = None
+        if held is not None and held in live_tids:
+            # (1) HOLD: the committed track is still live -> keep it. Its
+            # action-correlation NATURALLY drops during quiet (mostly-stay)
+            # periods -- that is NOT evidence the controlled object changed,
+            # so we do NOT release on low corr (the old gate did, and lost
+            # the commit the moment the reflex settled into mostly-stay).
+            chosen = held
+        elif held is not None and self._controlled_last_pos is not None:
+            # (2) HEIR (churn bridge): the committed track DIED (e.g. the
+            # paddle's track coasts out at a ball-contact and restarts with a
+            # new id). The controlled object does NOT teleport and its shape
+            # class persists, so the heir is the live track of the SAME shape
+            # class nearest to the last known position. This re-recognizes the
+            # new paddle track WITHOUT needing action variation (which quiet
+            # periods don't provide). GENERAL: object permanence + kind
+            # constancy -- no Pong vocabulary.
+            hx, hy = self._controlled_last_pos
+            hw, hh = self._controlled_shape or (0.0, 0.0)
+            h_asp = (hw / hh) if hh > 1e-6 else 1.0
+            h_elong = not (0.5 <= h_asp <= 2.0)
+            best_d2, heir = None, None
+            for t in tracks:
+                tw = float(t.get("w", 0.0)); th = float(t.get("h", 0.0))
+                if tw < 1e-6 or th < 1e-6:
+                    continue
+                t_asp = tw / th
+                t_elong = not (0.5 <= t_asp <= 2.0)
+                if t_elong != h_elong:
+                    continue   # different shape class -> not the heir
+                dx = t.get("cx", 0.0) - hx
+                dy = t.get("cy", 0.0) - hy
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best_d2, heir = d2, t["id"]
+            if heir is not None and best_d2 is not None \
+                    and best_d2 < (self.CONTROLLED_HEIR_RADIUS ** 2):
+                chosen = heir
+            else:
+                # no positional heir -> newly commit via correlation if able
+                if best_tid is not None and best_corr >= self.CONTROLLED_CORR_GATE:
+                    chosen = best_tid
         else:
-            if best_corr < self.CONTROLLED_CORR_GATE:
-                return None   # nothing reacts enough to NEWLY commit
-        self._controlled_slot = best_slot
-        for tid, sl in self._slot_map.items():
-            if sl == best_slot and any(t["id"] == tid for t in tracks):
-                return tid
-        return None
+            # (3) COLD COMMIT: no held track -> newly commit on correlation
+            if best_tid is not None and best_corr >= self.CONTROLLED_CORR_GATE:
+                chosen = best_tid
+        if chosen is None:
+            return None
+        self._controlled_track_id = chosen
+        sl = self._slot_map.get(chosen)
+        if sl is None:
+            return None
+        self._controlled_slot = sl
+        # record the chosen track's live position + shape for next frame's
+        # heir search
+        for t in tracks:
+            if t["id"] == chosen:
+                self._controlled_last_pos = (float(t.get("cx", 0.0)),
+                                             float(t.get("cy", 0.0)))
+                self._controlled_shape = (float(t.get("w", 0.0)),
+                                          float(t.get("h", 0.0)))
+                break
+        return chosen
 
     # ---- the dynamic-rollout stop rule (no Pong geometry) ----
     def _is_unrealistic(self, state, corr_norm):
@@ -1161,21 +1261,29 @@ class WorldModel:
             a = int(a)
             if a == neutral: return 0.0
             return +1.0 if a < neutral else -1.0
-        sc = np.array([scalar(h[0]) for h in hist], dtype=np.float64)
-        sc0 = sc - sc.mean()
-        if float(np.sqrt((sc0 ** 2).sum())) < 1e-9:
+        sc_all = np.array([scalar(h[0]) for h in hist], dtype=np.float64)
+        if float(np.sqrt(((sc_all - sc_all.mean()) ** 2).sum())) < 1e-9:
             return None   # no action variation -> can't fit a slope
         best_axis, best_gain = None, 0.0
         for axis in (0, 1):
-            v = np.array([h[1 + axis] for h in hist], dtype=np.float64)
-            v = v - v.mean()
-            vv = float(np.sqrt((v ** 2).sum()))
+            # Regress the per-frame POSITION DELTA on the action scalar -- NOT
+            # the reported velocity (an EMA that LAGS and underestimates the
+            # true displacement; that made the imagined paddle ~5x too slow,
+            # so the planner's intercept predictions were systematically
+            # wrong). delta[t]=pos[t+1]-pos[t] is caused by action[t+1], so
+            # align delta with sc_all[1:]. Track-id stable -> no slot churn.
+            pos = np.array([h[1 + axis] for h in hist], dtype=np.float64)
+            d = np.diff(pos)                 # px displacement per frame
+            a = sc_all[1:]                    # the action that drove each delta
+            d = d - d.mean()
+            a0 = a - a.mean()
+            vv = float(np.sqrt((d ** 2).sum()))
             if vv < 1e-9:
                 continue
-            denom = float((sc0 ** 2).sum())
+            denom = float((a0 ** 2).sum())
             if denom < 1e-12:
                 continue
-            gain = float((v * sc0).sum() / denom)
+            gain = float((d * a0).sum() / denom)
             if abs(gain) > abs(best_gain):
                 best_gain, best_axis = gain, axis
         if best_axis is None or abs(best_gain) < 1e-3:
@@ -1228,6 +1336,40 @@ class WorldModel:
             # elastic reflection (e=1.0; learning a per-surface restitution
             # is a future refinement -- the rare-event wall is already
             # sidestepped by computing the bounce).
+            #
+            # FINITE-SURFACE GATE: a surface is FINITE along the TANGENT axis
+            # (a paddle has a short y-extent; only a wall spans everything).
+            # It reflects a moving object ONLY if the two OVERLAP along the
+            # tangent -- otherwise the object flies PAST the surface (no
+            # bounce). Without this gate the paddle is an INFINITE WALL: the
+            # ball always bounces at the plane whatever the paddle's y, so
+            # every imagined action produces the same future and a planner
+            # can never discriminate 'intercept' from 'miss'. The surface's
+            # tangent position is its CURRENT imagined position (the paddle
+            # MOVES along the tangent under the imagined action -- that is
+            # exactly the lever the planner pulls). GENERAL: 'a finite
+            # surface reflects only what actually hits it' -- no Pong vocab.
+            tangent = 1 - axis
+            sj = s_slot * self.STATE_PER_OBJ
+            surf_t = float(s[sj + tangent])
+            surf_present = (abs(s[sj]) + abs(s[sj + 1])) > 1e-6
+            surf_shape = self._slot_shape.get(s_slot)
+            # unknown extent -> treat as a full wall (always overlaps), so
+            # we never LOSE a real bounce (e.g. W3b) to a missing shape.
+            surf_half_t = (0.5 * surf_shape[tangent]
+                           if surf_shape and surf_shape[tangent] > 1e-6
+                           else 0.5)
+            # The FINITE-SURFACE miss-gate applies ONLY to the surface I
+            # CONTROL (the my-paddle): its imagined tangent position is
+            # reliable (the action moves it -- that's the lever the planner
+            # pulls), and its finiteness is what lets the planner discriminate
+            # 'intercept' from 'miss'. OTHER surfaces (the opp paddle, walls)
+            # reflect unconditionally (the old infinite-wall rule): their
+            # discovered `s_slot` can be STALE under slot churn, so reading
+            # their current imagined y is unreliable and would lose real
+            # bounces (it regressed W3b). Robustness-driven, not Pong-specific:
+            # we only trust the position of the object we ourselves move.
+            finite = (s_slot == self._controlled_slot and surf_half_t < 0.5)
             for i in range(self.MAX_OBJECTS):
                 if i == s_slot:
                     continue
@@ -1254,6 +1396,13 @@ class WorldModel:
                     # moving toward the surface (v points from before-side to
                     # the plane)
                     if ((p_b - spos) > 0 and v < 0) or ((p_b - spos) < 0 and v > 0):
+                        # overlap along the tangent? (only for the finite
+                        # controlled surface -- see `finite` above.)
+                        obj_half_t = 0.5 * (ih if tangent == 1 else iw)
+                        gap = abs(float(s[ij + tangent]) - surf_t)
+                        if finite and surf_present \
+                                and gap > (surf_half_t + obj_half_t):
+                            continue   # no overlap -> the object flies PAST
                         # reflect normal velocity, clamp position to the surface
                         s[ij + 2 + axis] = -v
                         s[ij + axis] = spos + np.sign(p_b - spos) * (half + 1e-4)
