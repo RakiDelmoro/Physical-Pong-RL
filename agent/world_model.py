@@ -1241,6 +1241,30 @@ class WorldModel:
     SURFACE_POS_VAR = 1e-3     # max position variance along the normal axis (~paddle-width scale)
     SURFACE_GAP = 0.05        # cluster split gap (bigger than a surface, smaller than a roam)
     SURFACE_MIN_N = 15        # min samples in a cluster to count as a surface
+    # REFLECTION-EVENT surface discovery. Position-cluster discovery finds
+    # surfaces that have an OBJECT sitting still at them (paddles). It CANNOT
+    # find walls/floors/ceilings -- nothing sits at a wall, the wall only
+    # manifests when the ball BOUNCES off it. So we ALSO discover surfaces
+    # from reflection EVENTS: wherever a moving slot's velocity along an axis
+    # REVERSES at a consistent position, that position is a surface plane on
+    # that axis. GENERAL (ContactNets: learn where the surfaces are from the
+    # contact events): catches walls, floors, ceilings, AND paddles (the ball
+    # reverses at a paddle too) -- redundant with position-cluster for
+    # paddles, and the only way to find an object-less surface like a wall.
+    SURFACE_REFL_FRAMES = 80  # history window to scan for velocity reversals
+    SURFACE_REFL_MIN_N = 3    # min reversals in a cluster to call it a surface
+                              # (bounces are rarer than 'object sits here' samples)
+    SURFACE_REFL_WIN = 3      # turnaround = a LOCAL EXTREMUM over a ±WIN
+                              # step window (the EMA rounds off the bounce peak,
+                              # so the ADJACENT-step reversal is tiny -- a
+                              # windowed extremum still registers it)
+    SURFACE_REFL_MINPROM = 0.02  # min prominence of a turnaround: the peak must
+                              # drop this much (normalized) to the window edges
+                              # (a real wall bounce reverses a real run; EMA
+                              # wiggles don't)
+    SURFACE_REFL_POS_VAR = 4e-3  # max position variance of a reversal cluster
+                                 # (looser than POS_VAR: the post-bounce clamp
+                                 #  position jitters a little)
     def _discover_surfaces(self):
         """Return a list of (slot, normal_axis, surface_pos, half_extent) for
         each DISCOVERED surface, by POSITION CLUSTER (slot-churn + shape-label
@@ -1273,7 +1297,31 @@ class WorldModel:
                     ys_samples.append((cy, slot))
         out += self._cluster_surface_planes(xs_samples, normal_axis=0)
         out += self._cluster_surface_planes(ys_samples, normal_axis=1)
+        out += self._discover_surfaces_from_reflections()
+        # DEDUPE by (axis, plane_pos): a paddle discovered by BOTH methods
+        # (position-cluster AND reflection) would reflect the ball TWICE
+        # (flip -> flip back = no bounce) if listed twice. Keep one surface
+        # per (axis, plane_pos within SURFACE_GAP); prefer the position-cluster
+        # one (it has a real slot + shape) over the reflection one.
+        out = self._dedupe_surfaces(out)
         return out
+
+    def _dedupe_surfaces(self, surfaces):
+        """Keep one surface per (axis, plane_pos within SURFACE_GAP). Prefer
+        entries whose slot is a real tracked object (position-clustered) so the
+        finite-surface gate has a shape to work with."""
+        kept = []
+        for s in surfaces:
+            s_slot, axis, spos, half = s
+            dup = False
+            for k in kept:
+                _, kaxis, kpos, _ = k
+                if kaxis == axis and abs(kpos - spos) < self.SURFACE_GAP:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(s)
+        return kept
 
     def _cluster_surface_planes(self, samples, normal_axis):
         """Group samples by position along the normal axis; a tight cluster
@@ -1301,6 +1349,95 @@ class WorldModel:
             sh = self._slot_shape.get(live_slot, (0.02, 0.02))
             half_extent = 0.5 * (sh[normal_axis] if sh[normal_axis] > 1e-6 else 0.02)
             out.append((live_slot, normal_axis, plane_pos, half_extent))
+        return out
+
+    def _discover_surfaces_from_reflections(self):
+        """Discover surfaces from POSITION TURNING POINTS in the recent
+        stream: wherever a moving object's position along an axis reaches a
+        local extremum (a turnaround), that extremum position is a surface
+        plane on that axis. This is the ONLY way to find an OBJECT-LESS
+        surface (a wall / floor / ceiling -- nothing sits there, it only
+        shows up when the ball bounces off it). Position-cluster discovery
+        cannot find these.
+
+        We use POSITION turning points, not VELOCITY sign flips, because the
+        state's velocity is an EMA that SMEARS and lags the bounce. The
+        POSITION is directly observed and clean. And we scan PER TRACK ID
+        (self._track_pos), NOT per slot: a SLOT is recycled across objects
+        (the ball resets, a paddle churns) so a slot's position history mixes
+        multiple objects and produces FAKE turnarounds mid-field (measured: a
+        spurious y-surface at 0.49). A track id is one object's clean
+        identity, so its position only turns around at REAL surfaces. GENERAL
+        (ContactNets: learn where the surfaces are from the contact events):
+        also re-discovers paddles (the ball's cx turns around at a paddle) --
+        redundant with position-cluster, deduped by _dedupe_surfaces.
+        Returns [(slot, normal_axis, plane_pos, half_extent), ...] (the slot
+        is the turning object's current slot, for shape/extent; object-less
+        walls reflect unconditionally regardless of extent -- the finite
+        gate only applies to the controlled surface).
+        """
+        out = []
+        norm = [self.frame_w, self.frame_h]
+        for axis in (0, 1):
+            samples = []   # (plane_pos, track_id) at each position turnaround
+            for tid, h in self._track_pos.items():
+                if len(h) < 2 * self.SURFACE_REFL_WIN + 1:
+                    continue
+                pos = np.array([r[1 + axis] for r in h], dtype=np.float64) \
+                    / norm[axis]   # NORMALIZED (state units)
+                # only MOVING objects turn around at surfaces; skip tracks
+                # that barely move along this axis. Normalized units.
+                if float(pos.max() - pos.min()) < 0.05:
+                    continue
+                # only FREE-MOVING objects (roam in BOTH axes) contribute
+                # turnarounds: a wall reflection reverses a freely moving
+                # object. A PADDLE is stationary along its normal (one axis)
+                # while roaming along the other, so its reversals are TRACKING
+                # (servoing toward the ball), not bounces -- and they land
+                # mid-field (measured: the opp paddle's y-turnarounds scattered
+                # at 0.32/0.58/0.83, producing spurious surfaces that made the
+                # imagination bounce the ball mid-field -> garbage trajectories).
+                # Requiring roam in BOTH axes keeps the ball, drops both paddles.
+                other = np.array([r[1 + (1 - axis)] for r in h], dtype=np.float64) \
+                    / norm[1 - axis]
+                if float(other.max() - other.min()) < 0.05:
+                    continue   # stationary along the other axis -> a paddle
+                for t in range(self.SURFACE_REFL_WIN, len(pos) - self.SURFACE_REFL_WIN):
+                    # WINDOWED local extremum: pos[t] is a turnaround if it is
+                    # the max (or min) over a ±WIN window AND it stands out by
+                    # >= MINPROM over the window edges. The EMA rounds the
+                    # bounce peak so the adjacent-step reversal is tiny; a
+                    # windowed extremum still sees it. Filters mid-field noise.
+                    K = self.SURFACE_REFL_WIN
+                    lo = pos[t - K]; hi = pos[t + K]
+                    if pos[t] >= lo and pos[t] >= hi:
+                        if pos[t] - min(lo, hi) >= self.SURFACE_REFL_MINPROM:
+                            samples.append((float(pos[t]), tid))
+                    elif pos[t] <= lo and pos[t] <= hi:
+                        if max(lo, hi) - pos[t] >= self.SURFACE_REFL_MINPROM:
+                            samples.append((float(pos[t]), tid))
+            if len(samples) < self.SURFACE_REFL_MIN_N:
+                continue
+            poss = np.array([s[0] for s in samples])
+            order = np.argsort(poss)
+            pos_s = poss[order]
+            gaps = np.diff(pos_s)
+            split = np.where(gaps > self.SURFACE_GAP)[0]
+            groups = np.split(order, split + 1)
+            for g in groups:
+                if len(g) < self.SURFACE_REFL_MIN_N:
+                    continue
+                gp = poss[g]
+                if float(np.var(gp)) > self.SURFACE_REFL_POS_VAR:
+                    continue
+                plane_pos = float(np.median(gp))
+                btid = samples[g[-1]][1]
+                bslot = self._slot_map.get(btid)
+                if bslot is None:
+                    continue
+                sh = self._slot_shape.get(bslot, (0.02, 0.02))
+                half = 0.5 * (sh[axis] if sh[axis] > 1e-6 else 0.02)
+                out.append((bslot, axis, plane_pos, half))
         return out
 
     # ==================================================================
